@@ -73,6 +73,7 @@ Mods are plain Lua 5.4 scripts. There is no build step and no manifest.
 | `tunnet.credits()` / `tunnet.set_credits(n)` | Read/write the player's credits. |
 | `tunnet.story_unlock(name)` / `tunnet.set_story_unlock(name, bool)` | Read/write story unlock flags: `digging`, `relay`, `hub`, `filter`, `scan_short`, `scan_long`, `jetpack`, `antivirus`, `sprint`, `optical_fiber`, `antenna`, `surface`, `companion`. |
 | `tunnet.read_resource(name, offset, kind)` / `tunnet.write_resource(name, offset, kind, value)` | Generic typed field access. `kind` is `"u8"`, `"u32"`, `"i32"`, or `"f32"`. |
+| `tunnet.asset_bytes(path)` | Read an asset's bytes by logical path (returns `nil` if not found). Mods can add brand-new paths via `override_asset`; they're served on demand by the asset IO hook. |
 | `tunnet.mem.*` | Low-level memory access (advanced). See below. |
 | `tunnet.override_asset(logical_path, relative_file)` | Replace an embedded asset. See below. |
 
@@ -177,15 +178,22 @@ Outputs land in `data/` (gitignored) and `assets_extracted/` (gitignored).
   `set_credits`), story unlock flags (`tunnet.story_unlock` /
   `set_story_unlock`), and arbitrary resource fields by offset
   (`tunnet.read_resource` / `write_resource`).
+- **New asset files.** Mods can register brand-new asset paths with
+  `override_asset`; the asset IO hook serves them on demand, and
+  `tunnet.asset_bytes(path)` reads any asset's bytes.
 - Write to `core.log`.
 
 ### Not yet (roadmap)
 
-- **Other fields / entities / UI.** Only the credits and the 13 unlock flags
-  have named accessors; other fields need per-type offsets (use
-  `read_resource`/`write_resource`). Entities, queries, spawning, and UI need
-  the entity/archetype/storage layouts. Game types only register in-game, so
-  call these after starting/loading a game (not at the main menu).
+- **Using new assets in-game.** `asset_bytes` returns raw bytes; creating a
+  Bevy asset handle and attaching it to entities/UI needs entity/archetype
+  access (next milestone).
+- **Entities / player position / spawning.** Needs the entity/archetype/storage
+  layouts; not exposed yet.
+- **Other fields.** Only credits and the 13 unlock flags have named accessors;
+  other fields need per-type offsets (use `read_resource`/`write_resource`).
+  Game types only register in-game, so call these after starting/loading a game
+  (not at the main menu).
 - **New content.** You can replace existing assets, but you cannot add brand-new
   asset paths the game never requests (until a loader hook supports it).
 - **Save/config interception.** Runtime save/load hooks are planned; for now

@@ -107,6 +107,102 @@ unsafe extern "C" fn add_asset_hook(
     }
 }
 
+// --------------------------------------------------------- asset IO (new files)
+// Hook `EmbeddedAssetIo::load_path_sync` (RVA 0x81fd20) so that any requested
+// path can be served from a mod's registered files, not just the 608 embedded
+// ones. This is what lets mods add brand-new assets.
+// Win x64: rcx=sret, rdx=self, r8=path.ptr, r9=path.len.
+type LoadPathSyncFn = unsafe extern "C" fn(*mut c_void, *mut c_void, *const u8, usize);
+static LOAD_PATH_SYNC: Lazy<Mutex<Option<GenericDetour<LoadPathSyncFn>>>> =
+    Lazy::new(|| Mutex::new(None));
+static EMBEDDED_IO: AtomicUsize = AtomicUsize::new(0);
+static INSERTED_PATHS: Lazy<Mutex<std::collections::HashSet<String>>> =
+    Lazy::new(|| Mutex::new(std::collections::HashSet::new()));
+
+unsafe fn ensure_override_inserted(
+    this: *mut c_void,
+    path: &str,
+    path_ptr: *const u8,
+    path_len: usize,
+) {
+    if let Some((dptr, dlen)) = lookup_override(path) {
+        let need = INSERTED_PATHS
+            .lock()
+            .map(|s| !s.contains(path))
+            .unwrap_or(false);
+        if need {
+            if let Ok(g) = ADD_ASSET.lock() {
+                if let Some(add) = g.as_ref() {
+                    let _ = add.call(this, path_ptr, path_len, dptr, dlen);
+                }
+            }
+            if let Ok(mut s) = INSERTED_PATHS.lock() {
+                s.insert(path.to_string());
+            }
+            log(&format!("[assets] inserted asset {path} ({dlen} bytes)"));
+        }
+    }
+}
+
+unsafe extern "C" fn load_path_sync_hook(
+    sret: *mut c_void,
+    this: *mut c_void,
+    path_ptr: *const u8,
+    path_len: usize,
+) {
+    EMBEDDED_IO.store(this as usize, Ordering::Relaxed);
+    let path = std::str::from_utf8(std::slice::from_raw_parts(path_ptr, path_len)).unwrap_or("");
+    ensure_override_inserted(this, path, path_ptr, path_len);
+    if let Ok(g) = LOAD_PATH_SYNC.lock() {
+        if let Some(d) = g.as_ref() {
+            d.call(sret, this, path_ptr, path_len);
+        }
+    }
+}
+
+/// Call the game's loader for `path` and return the bytes if found.
+unsafe fn load_asset_bytes(path: &str) -> Option<Vec<u8>> {
+    let this = EMBEDDED_IO.load(Ordering::Relaxed);
+    if this == 0 {
+        return None;
+    }
+    // Leak the path so any insertion keeps a stable key.
+    let leaked: &'static [u8] = Box::leak(path.as_bytes().to_vec().into_boxed_slice());
+    ensure_override_inserted(this as *mut c_void, path, leaked.as_ptr(), leaked.len());
+    // Result<Vec<u8>, AssetIoError> is returned via sret; 64 bytes is enough.
+    let mut buf = [0u8; 64];
+    if let Ok(g) = LOAD_PATH_SYNC.lock() {
+        if let Some(d) = g.as_ref() {
+            d.call(
+                buf.as_mut_ptr() as *mut c_void,
+                this as *mut c_void,
+                leaked.as_ptr(),
+                leaked.len(),
+            );
+        }
+    }
+    // Observed sret layout for Ok(Vec<u8>): tag@0, len@8, ptr@0x10, cap@0x18.
+    let len = u64::from_le_bytes(buf[8..16].try_into().unwrap()) as usize;
+    let p = u64::from_le_bytes(buf[16..24].try_into().unwrap()) as usize;
+    if p > 0x10000 && len > 0 && len < 0x1000_0000 && is_readable(p, len) {
+        return Some(std::slice::from_raw_parts(p as *const u8, len).to_vec());
+    }
+    // Fallback: (ptr, cap, len) at offset 0 or 8.
+    for base in [0usize, 8usize] {
+        let p = u64::from_le_bytes(buf[base..base + 8].try_into().unwrap()) as usize;
+        let cap = u64::from_le_bytes(buf[base + 8..base + 16].try_into().unwrap()) as usize;
+        let len = u64::from_le_bytes(buf[base + 16..base + 24].try_into().unwrap()) as usize;
+        if p > 0x10000 && len > 0 && len <= cap && cap < 0x1000_0000 && is_readable(p, len) {
+            return Some(std::slice::from_raw_parts(p as *const u8, len).to_vec());
+        }
+    }
+    if std::env::var("TUNNET_DEBUG_ASSET").is_ok() {
+        let hex: String = buf.iter().map(|b| format!("{b:02x}")).collect();
+        log(&format!("[assets] load_asset_bytes({path}) sret={hex}"));
+    }
+    None
+}
+
 // -------------------------------------------------------------- frame hook
 type PeekMessageFn =
     unsafe extern "system" fn(*mut MSG, windows::Win32::Foundation::HWND, u32, u32, u32) -> BOOL;
@@ -742,6 +838,17 @@ fn load_mods() {
         .unwrap(),
     );
 
+    // Read an asset's bytes by logical path (mod-provided files are served by
+    // the asset IO hook). Returns nil if not found.
+    let _ = api.set(
+        "asset_bytes",
+        lua.create_function(|lua, path: String| match unsafe { load_asset_bytes(&path) } {
+            Some(b) => Ok(mlua::Value::String(lua.create_string(&b)?)),
+            None => Ok(mlua::Value::Nil),
+        })
+        .unwrap(),
+    );
+
     // Low-level memory access. Advanced/dangerous: used to build typed ECS
     // accessors and to inspect the World. Invalid addresses will crash.
     let mem = lua.create_table().unwrap();
@@ -875,8 +982,24 @@ unsafe fn install_asset_hook() {
     }
 }
 
-unsafe fn install_frame_hook() {
-    let user32 = LoadLibraryW(w!("user32.dll")).unwrap_or_default();
+unsafe fn install_load_path_hook() {
+    let base = module_base();
+    let target = (base + 0x81fd20) as *const ();
+    let orig: LoadPathSyncFn = std::mem::transmute(target);
+    match GenericDetour::<LoadPathSyncFn>::new(orig, load_path_sync_hook) {
+        Ok(d) => {
+            if let Err(e) = d.enable() {
+                log(&format!("[core] load_path_sync enable failed: {e}"));
+            } else {
+                log("[core] load_path_sync hook installed");
+                *LOAD_PATH_SYNC.lock().unwrap() = Some(d);
+            }
+        }
+        Err(e) => log(&format!("[core] load_path_sync detour failed: {e}")),
+    }
+}
+
+unsafe fn install_frame_hook() {    let user32 = LoadLibraryW(w!("user32.dll")).unwrap_or_default();
     let Some(proc) = GetProcAddress(user32, s!("PeekMessageW")) else {
         log("[core] PeekMessageW not found");
         return;
@@ -999,6 +1122,7 @@ unsafe fn init(module_usize: usize) {
     log("==================== tunnet-core attach ====================");
     log(&format!("[core] module base = {:#x}", module_base()));
     install_asset_hook();
+    install_load_path_hook();
     install_frame_hook();
     install_update_hook();
     install_resget_hook();

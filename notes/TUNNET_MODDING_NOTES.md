@@ -589,3 +589,48 @@ after write: credits=999 jetpack=true
   player position via the `tunnet::player::Body` transform.
 - Entities/queries/spawning and UI; save/config hooks; update-resilient
   signatures.
+
+---
+
+## 18. New assets — asset IO hook (2026-10-05)
+
+### Goal
+Let mods ship brand-new asset files (not just replace the 608 embedded ones).
+
+### Hook: `EmbeddedAssetIo::load_path_sync` @ RVA 0x81fd20
+Found as the function after `add_asset` that hashes the path via the same
+hasher (`0x14081d470`) and does a hashbrown lookup on `self+0x20/0x38`.
+Win x64 ABI (large `Result` return via sret):
+```
+rcx = sret (Result<Vec<u8>, AssetIoError>)
+rdx = self (&EmbeddedAssetIo)
+r8  = path.ptr   r9 = path.len
+```
+The hook:
+1. records `self` (`EMBEDDED_IO`) for later manual loads,
+2. if the path is a mod override and not yet inserted, inserts it by calling
+   the **original `add_asset`** (via its detour trampoline) with leaked bytes,
+3. calls the original `load_path_sync`.
+
+This means any path the game requests resolves to a mod file, including paths
+that were never in the embedded table.
+
+### Manual load API
+`tunnet.asset_bytes(path)`:
+- ensures the override is inserted, then calls the original `load_path_sync`
+  via the trampoline with an sret buffer,
+- parses `Result<Vec<u8>, AssetIoError>`: **tag@0, len@8, ptr@0x10, cap@0x18**
+  (observed), with a `(ptr,cap,len)` fallback,
+- returns a Lua string (or nil).
+
+Verified in-game:
+```
+[assets] inserted asset textures/example_new.png (487 bytes)
+[lua] example mod: new asset bytes = 487
+```
+
+### Next
+- Entity/archetype access: player position (via `tunnet::player::Body`
+  transform) and spawning entities; then attach loaded assets to entities/UI
+  (Bevy asset handles), enabling real new content.
+- Save/config hooks; update-resilient signatures.

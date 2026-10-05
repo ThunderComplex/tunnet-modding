@@ -41,6 +41,9 @@ tunnet.on_update(function()
             tunnet.credits(),
             tostring(tunnet.story_unlock("digging")),
             tostring(tunnet.story_unlock("jetpack"))))
+        local b = tunnet.asset_bytes("textures/example_new.png")
+        tunnet.log(string.format("example mod: new asset bytes = %s",
+            b and #b or "nil"))
         -- Writes (uncomment to try):
         -- tunnet.set_credits(999)
         -- tunnet.set_story_unlock("jetpack", true)
@@ -50,3 +53,5 @@ end)
 -- Replace the Puzzled Squid logo texture with a different icon (visible test).
 -- Paths are relative to this mod's own directory; they cannot escape it.
 tunnet.override_asset("textures/puzzled_squid.png", "puzzled_squid.png")
+-- Register a brand-new asset path (not in the game's embedded table).
+tunnet.override_asset("textures/example_new.png", "puzzled_squid.png")
