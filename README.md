@@ -67,6 +67,8 @@ Mods are plain Lua 5.4 scripts. There is no build step and no manifest.
 | `tunnet.on_update(fn)` | Register `fn()` to run once per game frame from inside Bevy's `App::update`, just before the frame's systems run. ECS-synced. |
 | `tunnet.frame()` | Number of `App::update` frames so far. |
 | `tunnet.world_ptr()` | Address of the game's Bevy `World` (0 until the first update). |
+| `tunnet.components()` | Array of registered component/resource type names (e.g. `"tunnet::state::GameState"`). |
+| `tunnet.component_id(name)` | `ComponentId` index for a type name, or `nil` if not registered yet. |
 | `tunnet.mem.*` | Low-level memory access (advanced). See below. |
 | `tunnet.override_asset(logical_path, relative_file)` | Replace an embedded asset. See below. |
 
@@ -163,16 +165,20 @@ Outputs land in `data/` (gitignored) and `assets_extracted/` (gitignored).
 - **ECS hook.** Run code once per game frame from inside Bevy's `App::update`
   (`tunnet.on_update`) and get the game's `World` pointer (`tunnet.world_ptr()`),
   plus low-level `tunnet.mem.*` read/write.
+- **Component registry.** List every registered component/resource type name
+  (`tunnet.components()`) and look up a type's `ComponentId`
+  (`tunnet.component_id(name)`).
 - Write to `core.log`.
 
 ### Not yet (roadmap)
 
-- **Typed game-state access.** The World pointer and raw memory API exist, but
-  there are no typed accessors yet for credits, story flags, inventory, entities,
-  or UI. Game types are not in Bevy's reflection registry and their Rust
-  `TypeId`s cannot be reconstructed from outside, so this needs the component
-  registry (name -> id) reversed from the running `World`. This is the next
-  milestone.
+- **Typed resource access.** You can find a type's `ComponentId`, but there is
+  no `tunnet.resource(name)` yet (reading/writing the resource data by
+  `ComponentId` needs Bevy's `Storages.tables.resources` layout reversed). Game
+  types only appear in the registry once the game registers them (e.g. after
+  starting/loading a game, not at the main menu).
+- **Entities/queries, spawning, UI.** Require the entity/archetype/storage
+  layouts; not exposed yet.
 - **New content.** You can replace existing assets, but you cannot add brand-new
   asset paths the game never requests (until a loader hook supports it).
 - **Save/config interception.** Runtime save/load hooks are planned; for now

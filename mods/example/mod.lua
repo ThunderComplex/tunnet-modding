@@ -24,6 +24,12 @@ tunnet.on_update(function()
             "example mod: first ECS update; world @ 0x%x (byte0=%d)",
             w, tunnet.mem.read_u8(w)))
     end
+    if tunnet.frame() == 5 then
+        local comps = tunnet.components()
+        tunnet.log(string.format("example mod: %d types registered", #comps))
+        tunnet.log("example mod: GameState id = " ..
+            tostring(tunnet.component_id("tunnet::state::GameState")))
+    end
 end)
 
 -- Replace the Puzzled Squid logo texture with a different icon (visible test).

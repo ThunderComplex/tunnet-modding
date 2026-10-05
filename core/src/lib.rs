@@ -21,6 +21,9 @@ use windows::Win32::System::LibraryLoader::{
     GetModuleFileNameW, GetModuleHandleW, GetProcAddress, LoadLibraryW,
 };
 use windows::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
+use windows::Win32::System::Memory::{
+    VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT,
+};
 use windows::Win32::System::Threading::{
     GetCurrentProcessId, OpenEventW, SetEvent, EVENT_MODIFY_STATE,
 };
@@ -161,6 +164,108 @@ static APP_UPDATE: Lazy<Mutex<Option<GenericDetour<AppUpdateFn>>>> =
     Lazy::new(|| Mutex::new(None));
 static WORLD_PTR: AtomicUsize = AtomicUsize::new(0);
 static UPDATE_COUNT: AtomicU64 = AtomicU64::new(0);
+static WORLD_DUMPED: AtomicBool = AtomicBool::new(false);
+
+unsafe fn is_readable(addr: usize, len: usize) -> bool {
+    if addr < 0x10000 {
+        return false;
+    }
+    let mut mbi = MEMORY_BASIC_INFORMATION::default();
+    let r = VirtualQuery(
+        Some(addr as *const c_void),
+        &mut mbi,
+        std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+    );
+    if r == 0 || mbi.State != MEM_COMMIT {
+        return false;
+    }
+    let base = mbi.BaseAddress as usize;
+    let end = base.saturating_add(mbi.RegionSize);
+    addr >= base && addr.saturating_add(len) <= end
+}
+
+unsafe fn read_u64_at(a: usize) -> u64 {
+    std::ptr::read_unaligned(a as *const u64)
+}
+
+/// Enumerate `World.components` (Vec<ComponentInfo>).
+/// This build: Vec header at World+0x180, entry stride 0x50, name String ptr
+/// at entry+0x30 (len at entry+0x38).
+unsafe fn component_names(world: usize) -> Vec<String> {
+    if world == 0 {
+        return Vec::new();
+    }
+    let vec_ptr = read_u64_at(world + 0x180) as usize;
+    let vec_len = read_u64_at(world + 0x190) as usize;
+    if vec_ptr < 0x10000 || vec_len == 0 || vec_len > 100_000 {
+        return Vec::new();
+    }
+    let mut names = Vec::new();
+    for i in 0..vec_len {
+        let e = vec_ptr + i * 0x50;
+        if !is_readable(e, 0x40) {
+            break;
+        }
+        let name_ptr = read_u64_at(e + 0x30) as usize;
+        let name_len = read_u64_at(e + 0x38) as usize;
+        if name_len == 0 || name_len > 300 || !is_readable(name_ptr, name_len) {
+            continue;
+        }
+        let b = std::slice::from_raw_parts(name_ptr as *const u8, name_len);
+        names.push(String::from_utf8_lossy(b).into_owned());
+    }
+    names
+}
+
+unsafe fn component_id(world: usize, name: &str) -> Option<usize> {
+    let names = component_names(world);
+    names.iter().position(|n| n == name)
+}
+
+unsafe fn dump_world_deep(world: usize) {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(world as u64).to_le_bytes());
+    let l0 = std::slice::from_raw_parts(world as *const u8, 0x800);
+    out.extend_from_slice(l0);
+    // Level 1: pointers in World[0..0x800].
+    let mut l2_count = 0usize;
+    for o in (0..0x800).step_by(8) {
+        let p = std::ptr::read_unaligned((world + o) as *const u64) as usize;
+        if !is_readable(p, 0x200) {
+            continue;
+        }
+        out.extend_from_slice(&1u64.to_le_bytes());
+        out.extend_from_slice(&(o as u64).to_le_bytes());
+        out.extend_from_slice(&(p as u64).to_le_bytes());
+        let b = std::slice::from_raw_parts(p as *const u8, 0x200);
+        out.extend_from_slice(b);
+        // Level 2: pointers inside the first 0x100 bytes of this buffer.
+        for o2 in (0..0x100).step_by(8) {
+            let q = std::ptr::read_unaligned((p + o2) as *const u64) as usize;
+            if !is_readable(q, 0x40) || l2_count > 6000 {
+                continue;
+            }
+            out.extend_from_slice(&2u64.to_le_bytes());
+            out.extend_from_slice(&(o as u64).to_le_bytes());
+            out.extend_from_slice(&(o2 as u64).to_le_bytes());
+            out.extend_from_slice(&(q as u64).to_le_bytes());
+            let b2 = std::slice::from_raw_parts(q as *const u8, 0x40);
+            out.extend_from_slice(b2);
+            l2_count += 1;
+        }
+    }
+    let path = CORE_DIR
+        .lock()
+        .map(|d| d.join("world_deep.bin"))
+        .unwrap_or_default();
+    let _ = std::fs::write(&path, &out);
+    log(&format!(
+        "[core] dumped world_deep -> {} ({} bytes, {} l2)",
+        path.display(),
+        out.len(),
+        l2_count
+    ));
+}
 
 unsafe extern "C" fn app_update_hook(app: *mut c_void) {
     let world = (app as usize).wrapping_add(APP_WORLD_OFFSET);
@@ -168,6 +273,32 @@ unsafe extern "C" fn app_update_hook(app: *mut c_void) {
     let n = UPDATE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     if n == 1 {
         log(&format!("[core] first App::update; world @ {:#x}", world));
+    }
+    if n == 180
+        && std::env::var("TUNNET_DUMP_WORLD").is_ok()
+        && !WORLD_DUMPED.swap(true, Ordering::Relaxed)
+    {
+        let bytes = std::slice::from_raw_parts(world as *const u8, 0x800);
+        let path = CORE_DIR
+            .lock()
+            .map(|d| d.join("world.bin"))
+            .unwrap_or_default();
+        let _ = std::fs::write(&path, bytes);
+        log(&format!("[core] dumped world -> {}", path.display()));
+        dump_world_deep(world);
+        let names = component_names(world);
+        if !names.is_empty() {
+            let cpath = CORE_DIR
+                .lock()
+                .map(|d| d.join("components.txt"))
+                .unwrap_or_default();
+            let _ = std::fs::write(&cpath, names.join("\n"));
+            log(&format!(
+                "[ecs] wrote {} component names -> {}",
+                names.len(),
+                cpath.display()
+            ));
+        }
     }
     // Run mod callbacks before the game's systems for this frame.
     on_update();
@@ -369,6 +500,28 @@ fn load_mods() {
     let _ = api.set(
         "frame",
         lua.create_function(|_, ()| Ok(UPDATE_COUNT.load(Ordering::Relaxed) as i64)).unwrap(),
+    );
+    // Registered component/resource type names (from Bevy's component registry).
+    let _ = api.set(
+        "components",
+        lua.create_function(|lua, ()| {
+            let world = WORLD_PTR.load(Ordering::Relaxed);
+            let names = unsafe { component_names(world) };
+            let t = lua.create_table()?;
+            for (i, n) in names.iter().enumerate() {
+                t.set(i + 1, n.clone())?;
+            }
+            Ok(t)
+        })
+        .unwrap(),
+    );
+    let _ = api.set(
+        "component_id",
+        lua.create_function(|_, name: String| {
+            let world = WORLD_PTR.load(Ordering::Relaxed);
+            Ok(unsafe { component_id(world, &name) }.map(|i| i as i64))
+        })
+        .unwrap(),
     );
 
     // Low-level memory access. Advanced/dangerous: used to build typed ECS

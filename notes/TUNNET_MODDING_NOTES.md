@@ -450,3 +450,47 @@ Verified run:
 - Expose `tunnet.resource("tunnet::story::Story")` etc. and typed field access.
 - Then entities/queries and UI.
 - Save/config hooks and update-resilient signatures remain on the roadmap.
+
+---
+
+## 15. Component registry reversed (2026-10-05)
+
+### Method
+`World::resource::<T>` monomorphizations were located via the panic string
+`` Requested resource {} does not exist in the `World`. `` (see
+`analysis/find_resource_lookup.py`). Their disassembly gave the `Components`
+HashMaps near `World+0x218`. Because Rust reorders fields, offsets were then
+determined **empirically**: the core dumps `World[0..0x800]` plus one level of
+heap (each readable pointer's first `0x200`/`0x40` bytes), validated with
+`VirtualQuery` (`is_readable`), behind `TUNNET_DUMP_WORLD=1`
+(`world.bin`, `world_deep.bin`; analyzer `analysis/analyze_world_deep.py`).
+
+### Layout (this build)
+- `World.components.components` (`Vec<ComponentInfo>`): header at **World+0x180**
+  (ptr/cap/len at +0x180/+0x188/+0x190).
+- Entry stride **0x50**. `ComponentInfo`:
+  - `+0x00` `ComponentId` (usize index)
+  - `+0x30` `descriptor.name` ptr, `+0x38` name len (empirical; fields are
+    reordered, so Bevy source order is not usable)
+  - `+0x40` `drop` fn pointer
+- Bevy source (v0.7.0) for reference: `World { id, entities, components,
+  archetypes, storages, bundles, removed_components, ... }`;
+  `Components { components: Vec<ComponentInfo>, indices: HashMap<TypeId,usize>,
+  resource_indices: HashMap<TypeId,usize> }`;
+  `ComponentInfo { id, descriptor }`;
+  `ComponentDescriptor { name: String, storage_type, is_send_and_sync,
+  type_id: Option<TypeId>, layout, drop }`; `Storages { sparse_sets, tables }`
+  (resources live in `Storages.tables`).
+
+### API added
+- `tunnet.components()` -> array of registered type names.
+- `tunnet.component_id(name)` -> `ComponentId` index or nil.
+- Verified: at the main menu, 127 types are registered, all engine types except
+  `bevy_ecs::schedule::state::State<tunnet::state::GameState>`; the game's own
+  components/resources register later (once a game starts), so they appear
+  in-game.
+
+### Next
+- Reverse `Storages.tables` to turn a `ComponentId` into a resource data
+  pointer: expose `tunnet.resource(name) -> ptr` and typed field access.
+- Then entities/queries and UI; save/config hooks; update-resilient signatures.
