@@ -13,12 +13,17 @@ Strategy:
 """
 import re
 import struct
+import sys
 import json
 from pathlib import Path
 from collections import Counter, defaultdict
 
-EXE = Path(r"G:\SteamLibrary\steamapps\common\Tunnet\tunnet.exe")
-OUT = Path(r"H:\dev\Rust\tunnet-modding\data")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import common
+
+args = common.common_parser("Recover the exact asset table from tunnet.exe.").parse_args()
+EXE = common.resolve_exe(args.exe)
+OUT = common.resolve_data(args.data)
 d = EXE.read_bytes()
 
 # ------------------------------------------------------------- PE sections

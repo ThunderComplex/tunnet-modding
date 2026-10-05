@@ -4,7 +4,18 @@ import re, struct, sys, bisect
 from pathlib import Path
 from collections import defaultdict
 
-EXE = Path(r"G:\SteamLibrary\steamapps\common\Tunnet\tunnet.exe")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import common
+
+args = common.common_parser(
+    "Print raw LEA reference instruction addresses for given string patterns.",
+    positional={
+        "name": "patterns",
+        "nargs": "*",
+        "help": "regex patterns matched against raw bytes (latin1)",
+    },
+).parse_args()
+EXE = common.resolve_exe(args.exe)
 d = EXE.read_bytes()
 e = struct.unpack_from("<I", d, 0x3C)[0]; c = e + 4
 n = struct.unpack_from("<H", d, c + 2)[0]; osz = struct.unpack_from("<H", d, c + 16)[0]
@@ -20,7 +31,7 @@ def off_to_va(off):
             return x["va"] + (off - x["rawptr"])
 text = secs[".text"]
 target_va = {}
-for pat in sys.argv[1:]:
+for pat in args.patterns:
     rx = re.compile(pat.encode("latin1"))
     for m in rx.finditer(d):
         va = off_to_va(m.start())

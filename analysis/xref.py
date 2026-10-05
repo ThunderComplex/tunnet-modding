@@ -13,7 +13,18 @@ import re, struct, sys, bisect
 from pathlib import Path
 from collections import defaultdict, Counter
 
-EXE = Path(r"G:\SteamLibrary\steamapps\common\Tunnet\tunnet.exe")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import common
+
+args = common.common_parser(
+    "Cross-reference string literals to referencing functions in tunnet.exe.",
+    positional={
+        "name": "patterns",
+        "nargs": "*",
+        "help": "regex patterns matched against raw bytes (latin1)",
+    },
+).parse_args()
+EXE = common.resolve_exe(args.exe)
 d = EXE.read_bytes()
 
 e = struct.unpack_from("<I", d, 0x3C)[0]; c = e + 4
@@ -42,7 +53,7 @@ def func_of(va):
         return fns[k][0]
     return fns[k][0] if k >= 0 else None  # nearest preceding (leaf fns lack .pdata)
 
-patterns = [p.encode("latin1") for p in sys.argv[1:]]
+patterns = [p.encode("latin1") for p in args.patterns]
 target_va = {}   # va -> text
 for pat in patterns:
     try:

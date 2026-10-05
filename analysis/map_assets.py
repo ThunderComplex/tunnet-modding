@@ -20,10 +20,12 @@ import sys
 import json
 from pathlib import Path
 
-EXE = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(
-    r"G:\SteamLibrary\steamapps\common\Tunnet\tunnet.exe")
-OUT = Path(sys.argv[2]) if len(sys.argv) > 2 else Path(
-    r"H:\dev\Rust\tunnet-modding\data")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import common
+
+args = common.common_parser("Map assets embedded in tunnet.exe.").parse_args()
+EXE = common.resolve_exe(args.exe)
+OUT = common.resolve_data(args.data)
 
 data = EXE.read_bytes()
 N = len(data)

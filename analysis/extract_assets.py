@@ -1,14 +1,24 @@
 #!/usr/bin/env python3
 """Extract all embedded assets using the recovered exact table, with validation."""
-import json, struct
+import json, struct, sys
 from pathlib import Path
 from collections import Counter
 
-EXE = Path(r"G:\SteamLibrary\steamapps\common\Tunnet\tunnet.exe")
-OUT = Path(r"H:\dev\Rust\tunnet-modding")
-TABLE = json.loads((OUT / "data" / "asset_table.json").read_text())
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import common
+
+parser = common.common_parser("Extract all embedded assets using the recovered table.")
+parser.add_argument(
+    "--dest",
+    default=None,
+    help="destination directory (default: <repo>/assets_extracted)",
+)
+args = parser.parse_args()
+EXE = common.resolve_exe(args.exe)
+DATA = common.resolve_data(args.data)
+TABLE = json.loads((DATA / "asset_table.json").read_text())
 d = EXE.read_bytes()
-DEST = OUT / "assets_extracted"
+DEST = Path(args.dest) if args.dest else common.REPO / "assets_extracted"
 
 def png_size(off):
     p = off + 8

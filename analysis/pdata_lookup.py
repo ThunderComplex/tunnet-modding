@@ -4,7 +4,18 @@ import struct, sys
 from pathlib import Path
 from bisect import bisect_right
 
-EXE = Path(r"G:\SteamLibrary\steamapps\common\Tunnet\tunnet.exe")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import common
+
+args = common.common_parser(
+    "List .pdata functions around a range and resolve containing functions.",
+    positional={
+        "name": "addresses",
+        "nargs": "*",
+        "help": "VAs to resolve, e.g. 0x1404e0ce0",
+    },
+).parse_args()
+EXE = common.resolve_exe(args.exe)
 d = EXE.read_bytes()
 e = struct.unpack_from("<I", d, 0x3C)[0]; c = e + 4
 n = struct.unpack_from("<H", d, c + 2)[0]; osz = struct.unpack_from("<H", d, c + 16)[0]
@@ -33,7 +44,7 @@ def containing(va):
         k -= 1
     return None
 
-for a in sys.argv[1:]:
+for a in args.addresses:
     va = int(a, 16)
     f = containing(va)
     if f:

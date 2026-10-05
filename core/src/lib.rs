@@ -36,6 +36,10 @@ static LAST_TICK_MS: AtomicU64 = AtomicU64::new(0);
 
 static LUA: Lazy<Mutex<Option<Lua>>> = Lazy::new(|| Mutex::new(None));
 
+/// Directory of the mod currently being loaded / whose callback is running.
+/// `override_asset` resolves relative paths against this and cannot escape it.
+static CURRENT_MOD_DIR: Lazy<Mutex<Option<PathBuf>>> = Lazy::new(|| Mutex::new(None));
+
 // ----------------------------------------------------------------- logging
 fn log(msg: &str) {
     use std::io::Write;
@@ -148,23 +152,54 @@ fn on_frame(dt_ms: f64) {
 fn dispatch(lua: &Lua, table: &str, dt_ms: f64) -> mlua::Result<()> {
     let tunnet: Table = lua.globals().get("tunnet")?;
     let cbs: Table = tunnet.get(table)?;
-    for pair in cbs.pairs::<i64, Function>() {
-        let (_, f) = pair?;
-        if table == "_frame" {
-            f.call::<()>(dt_ms)?;
+    for pair in cbs.pairs::<i64, Table>() {
+        let (_, entry) = pair?;
+        let dir: String = entry.get("dir").unwrap_or_default();
+        let f: Function = entry.get("fn")?;
+        // Scope override_asset to the mod that registered this callback.
+        if let Ok(mut cur) = CURRENT_MOD_DIR.lock() {
+            *cur = if dir.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(&dir))
+            };
+        }
+        let res = if table == "_frame" {
+            f.call::<()>(dt_ms)
         } else {
-            f.call::<()>(())?;
+            f.call::<()>(())
+        };
+        if let Err(e) = res {
+            log(&format!("[mods] {table} callback error: {e}"));
         }
     }
     Ok(())
 }
 
 // ------------------------------------------------------------------ mods
+fn mods_dir() -> PathBuf {
+    if let Ok(d) = std::env::var("TUNNET_MODS") {
+        if !d.is_empty() {
+            return PathBuf::from(d);
+        }
+    }
+    CORE_DIR
+        .lock()
+        .map(|d| d.join("mods"))
+        .unwrap_or_else(|_| PathBuf::from("mods"))
+}
+
+fn current_mod_dir_string() -> String {
+    CURRENT_MOD_DIR
+        .lock()
+        .ok()
+        .and_then(|d| d.clone())
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
 fn load_mods() {
-    let mods_dir = match CORE_DIR.lock() {
-        Ok(d) => d.join("mods"),
-        Err(_) => return,
-    };
+    let mods_dir = mods_dir();
     if !mods_dir.is_dir() {
         log(&format!("[mods] no mods dir at {}", mods_dir.display()));
         return;
@@ -193,13 +228,34 @@ fn load_mods() {
     let _ = api.set(
         "override_asset",
         lua.create_function(|_, (logical, file): (String, String)| {
-            let base = CORE_DIR.lock().map(|d| d.clone()).unwrap_or_default();
-            let path = if std::path::Path::new(&file).is_absolute() {
-                PathBuf::from(&file)
-            } else {
-                base.join("mods").join(&file)
-            };
-            match std::fs::read(&path) {
+            // Resolve strictly inside the calling mod's own directory.
+            let base = CURRENT_MOD_DIR
+                .lock()
+                .ok()
+                .and_then(|d| d.clone())
+                .ok_or_else(|| {
+                    mlua::Error::external(
+                        "override_asset called outside of a mod (call it at load time)",
+                    )
+                })?;
+            if std::path::Path::new(&file).is_absolute() {
+                return Err(mlua::Error::external(
+                    "override_asset: file must be relative to the mod directory",
+                ));
+            }
+            let candidate = base.join(&file);
+            let canon = candidate.canonicalize().map_err(|e| {
+                mlua::Error::external(format!("cannot open {}: {e}", candidate.display()))
+            })?;
+            let base_canon = base.canonicalize().map_err(|e| {
+                mlua::Error::external(format!("cannot resolve mod directory: {e}"))
+            })?;
+            if !canon.starts_with(&base_canon) {
+                return Err(mlua::Error::external(
+                    "override_asset: path escapes the mod directory",
+                ));
+            }
+            match std::fs::read(&canon) {
                 Ok(bytes) => {
                     let boxed = bytes.into_boxed_slice();
                     let len = boxed.len();
@@ -211,13 +267,13 @@ fn load_mods() {
                     }
                     log(&format!(
                         "[mods] override_asset {logical} <- {} ({len} bytes)",
-                        path.display()
+                        canon.display()
                     ));
                     Ok(())
                 }
                 Err(e) => Err(mlua::Error::external(format!(
                     "cannot read {}: {e}",
-                    path.display()
+                    canon.display()
                 ))),
             }
         })
@@ -234,7 +290,10 @@ fn load_mods() {
         lua.create_function(|lua, f: Function| {
             let tunnet: Table = lua.globals().get("tunnet")?;
             let cbs: Table = tunnet.get("_load")?;
-            cbs.set(cbs.len()? + 1, f)
+            let entry = lua.create_table()?;
+            entry.set("dir", current_mod_dir_string())?;
+            entry.set("fn", f)?;
+            cbs.set(cbs.len()? + 1, entry)
         })
         .unwrap(),
     );
@@ -243,7 +302,10 @@ fn load_mods() {
         lua.create_function(|lua, f: Function| {
             let tunnet: Table = lua.globals().get("tunnet")?;
             let cbs: Table = tunnet.get("_frame")?;
-            cbs.set(cbs.len()? + 1, f)
+            let entry = lua.create_table()?;
+            entry.set("dir", current_mod_dir_string())?;
+            entry.set("fn", f)?;
+            cbs.set(cbs.len()? + 1, entry)
         })
         .unwrap(),
     );
@@ -268,6 +330,9 @@ fn load_mods() {
     files.sort();
 
     for f in &files {
+        if let Ok(mut cur) = CURRENT_MOD_DIR.lock() {
+            *cur = f.parent().map(|p| p.to_path_buf());
+        }
         match std::fs::read_to_string(f) {
             Ok(src) => match lua.load(&src).set_name(f.to_string_lossy()).exec() {
                 Ok(()) => log(&format!("[mods] loaded {}", f.display())),
@@ -275,6 +340,9 @@ fn load_mods() {
             },
             Err(e) => log(&format!("[mods] cannot read {}: {e}", f.display())),
         }
+    }
+    if let Ok(mut cur) = CURRENT_MOD_DIR.lock() {
+        *cur = None;
     }
 
     // Fire on_load callbacks.

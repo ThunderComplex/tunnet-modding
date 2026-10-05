@@ -3,7 +3,14 @@
 import re, struct, sys
 from pathlib import Path
 
-EXE = Path(r"G:\SteamLibrary\steamapps\common\Tunnet\tunnet.exe")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import common
+
+args = common.common_parser(
+    "Find exact (delimited) occurrences of a string and xref them.",
+    positional={"name": "string", "nargs": "?", "help": "exact string to search for"},
+).parse_args()
+EXE = common.resolve_exe(args.exe)
 d = EXE.read_bytes()
 e = struct.unpack_from("<I", d, 0x3C)[0]; c = e + 4
 n = struct.unpack_from("<H", d, c + 2)[0]; osz = struct.unpack_from("<H", d, c + 16)[0]
@@ -18,7 +25,7 @@ def off_to_va(off):
         if x["rawptr"] <= off < x["rawptr"] + x["rawsize"]:
             return x["va"] + (off - x["rawptr"])
 text = secs[".text"]
-needle = sys.argv[1].encode("latin1")
+needle = args.string.encode("latin1")
 tva = text["va"]; tb = text["rawptr"]; tend = tb + text["vsize"]
 # exact-delimited occurrences (not part of a longer identifier/path)
 occ = []

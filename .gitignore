@@ -1,3 +1,6 @@
 assets_extracted/
 target/
 data/
+core.log
+deploy-test/
+__pycache__/

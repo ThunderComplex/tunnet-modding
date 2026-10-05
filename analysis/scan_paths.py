@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """Broad scan of asset-like path strings in tunnet.exe."""
+import sys
 import re
 from pathlib import Path
 from collections import Counter
 
-EXE = Path(r"G:\SteamLibrary\steamapps\common\Tunnet\tunnet.exe")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import common
+
+args = common.common_parser(
+    "Broad scan of asset-like path strings in tunnet.exe."
+).parse_args()
+EXE = common.resolve_exe(args.exe)
 d = EXE.read_bytes()
 
 rx = re.compile(

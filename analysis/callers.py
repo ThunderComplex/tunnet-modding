@@ -3,7 +3,14 @@
 import re, struct, sys, bisect
 from pathlib import Path
 
-EXE = Path(r"G:\SteamLibrary\steamapps\common\Tunnet\tunnet.exe")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import common
+
+args = common.common_parser(
+    "Find callers of a target VA (direct rel32 call/jmp) and show .pdata range.",
+    positional={"name": "address", "nargs": "?", "help": "target VA, e.g. 0x1404db3e0"},
+).parse_args()
+EXE = common.resolve_exe(args.exe)
 d = EXE.read_bytes()
 e = struct.unpack_from("<I", d, 0x3C)[0]; c = e + 4
 n = struct.unpack_from("<H", d, c + 2)[0]; osz = struct.unpack_from("<H", d, c + 16)[0]
@@ -24,7 +31,7 @@ def func_of(va):
     k = bisect.bisect_right(starts, va) - 1
     return fns[k][0] if k >= 0 else None
 
-target = int(sys.argv[1], 16)
+target = int(args.address, 16)
 # range
 k = bisect.bisect_right(starts, target) - 1
 print(f"target 0x{target:x}")

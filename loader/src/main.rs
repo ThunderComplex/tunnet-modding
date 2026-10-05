@@ -68,6 +68,8 @@ fn parse_args() -> Args {
         }
     }
 
+    // Defaults are resolved next to this executable, so the loader can simply be
+    // dropped into the Tunnet install directory and run from there.
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(Path::to_path_buf))
@@ -77,12 +79,6 @@ fn parse_args() -> Args {
     }
     if core == Path::new("core.dll") {
         core = exe_dir.join("core.dll");
-    }
-    if !game.exists() {
-        let steam = PathBuf::from(r"G:\SteamLibrary\steamapps\common\Tunnet\tunnet.exe");
-        if steam.exists() {
-            game = steam;
-        }
     }
 
     // The game relaunches itself via an internal launcher unless this flag is

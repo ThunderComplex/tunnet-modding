@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """Analyze blob references across all functions to classify unmapped blobs."""
-import re, struct, json
+import re, struct, json, sys
 from pathlib import Path
 from collections import Counter, defaultdict
 import bisect
 
-EXE = Path(r"G:\SteamLibrary\steamapps\common\Tunnet\tunnet.exe")
-OUT = Path(r"H:\dev\Rust\tunnet-modding\data")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import common
+
+args = common.common_parser("Analyze blob references across all functions.").parse_args()
+EXE = common.resolve_exe(args.exe)
+OUT = common.resolve_data(args.data)
 d = EXE.read_bytes()
 
 e_lfanew = struct.unpack_from("<I", d, 0x3C)[0]

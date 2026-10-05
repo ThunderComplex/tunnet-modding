@@ -10,13 +10,18 @@ blob" hypothesis).
 """
 import re
 import struct
+import sys
 import json
 import csv
 from pathlib import Path
 from collections import Counter
 
-EXE = Path(r"G:\SteamLibrary\steamapps\common\Tunnet\tunnet.exe")
-OUT = Path(r"H:\dev\Rust\tunnet-modding\data")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import common
+
+args = common.common_parser("Refined asset mapping for tunnet.exe.").parse_args()
+EXE = common.resolve_exe(args.exe)
+OUT = common.resolve_data(args.data)
 data = EXE.read_bytes()
 
 # ------------------------------------------------------------------ carving

@@ -16,4 +16,5 @@ tunnet.on_frame(function(dt)
 end)
 
 -- Replace the Puzzled Squid logo texture with a different icon (visible test).
-tunnet.override_asset("textures/puzzled_squid.png", "example/puzzled_squid.png")
+-- Paths are relative to this mod's own directory; they cannot escape it.
+tunnet.override_asset("textures/puzzled_squid.png", "puzzled_squid.png")

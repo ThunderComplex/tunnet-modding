@@ -9,14 +9,46 @@ Windows x64 method call `add_asset(&mut self, path: &Path, data: &[u8])`:
     rdx = path.ptr     r8  = path.len
     r9  = data.ptr     [rsp+0x20] = data.len
 """
-import re, struct, json, csv, subprocess
+import re, struct, json, csv, subprocess, os, shutil, sys
 from pathlib import Path
 from collections import Counter
 
-EXE = Path(r"G:\SteamLibrary\steamapps\common\Tunnet\tunnet.exe")
-OUT = Path(r"H:\dev\Rust\tunnet-modding\data")
-ASM = Path(r"C:\Users\THUNDE~1\AppData\Local\Temp\opencode\iaa.asm")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import common
+
+# include_all_assets() range in the analysed build.
+FUNC_START = 0x1408202C0
+FUNC_END = 0x140825AA5
+
+args = common.common_parser(
+    "Parse include_all_assets() disassembly and recover the exact asset table."
+).parse_args()
+EXE = common.resolve_exe(args.exe)
+OUT = common.resolve_data(args.data)
+ASM = OUT / "iaa.asm"
 d = EXE.read_bytes()
+
+# Generate the disassembly on demand (needs objdump; no hardcoded paths).
+if not ASM.is_file():
+    objdump = os.environ.get("TUNNET_OBJDUMP") or shutil.which("objdump")
+    if not objdump:
+        sys.exit(
+            "error: iaa.asm missing and objdump not found; "
+            "install binutils/objdump or set TUNNET_OBJDUMP"
+        )
+    proc = subprocess.run(
+        [
+            objdump,
+            "-d",
+            f"--start-address={FUNC_START:#x}",
+            f"--stop-address={FUNC_END:#x}",
+            str(EXE),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    ASM.write_text(proc.stdout, encoding="utf-8", errors="replace")
+    print(f"[+] wrote {ASM}")
 
 # sections for va<->off
 e = struct.unpack_from("<I", d, 0x3C)[0]; c = e + 4
