@@ -1,0 +1,391 @@
+//! Tunnet mod core (`core.dll`).
+//!
+//! Injected into `tunnet.exe` by the modloader. Installs the MVP hooks:
+//!   * `EmbeddedAssetIo::add_asset` (RVA 0x81fa10) — path-keyed asset override
+//!   * `PeekMessageW` (user32) — main-thread per-frame tick
+//!
+//! Mods are Lua scripts loaded from `<core dir>/mods` (see `mods/README`).
+
+use std::ffi::c_void;
+use std::os::windows::ffi::OsStrExt;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
+
+use mlua::{Function, Lua, Table};
+use once_cell::sync::Lazy;
+use retour::GenericDetour;
+use windows::core::{s, w, PCWSTR};
+use windows::Win32::Foundation::{BOOL, CloseHandle, FALSE, HMODULE, TRUE};
+use windows::Win32::System::LibraryLoader::{
+    GetModuleFileNameW, GetModuleHandleW, GetProcAddress, LoadLibraryW,
+};
+use windows::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
+use windows::Win32::System::Threading::{
+    GetCurrentProcessId, OpenEventW, SetEvent, EVENT_MODIFY_STATE,
+};
+use windows::Win32::UI::WindowsAndMessaging::MSG;
+
+// RVAs in this exact build (see notes sections 11/12).
+const RVA_ADD_ASSET: usize = 0x81fa10;
+
+static CORE_DIR: Lazy<Mutex<PathBuf>> = Lazy::new(|| Mutex::new(PathBuf::new()));
+static LOG_READY: AtomicBool = AtomicBool::new(false);
+static FRAME_COUNT: AtomicU64 = AtomicU64::new(0);
+static LAST_TICK_MS: AtomicU64 = AtomicU64::new(0);
+
+static LUA: Lazy<Mutex<Option<Lua>>> = Lazy::new(|| Mutex::new(None));
+
+// ----------------------------------------------------------------- logging
+fn log(msg: &str) {
+    use std::io::Write;
+    if !LOG_READY.load(Ordering::Relaxed) {
+        return;
+    }
+    if let Ok(dir) = CORE_DIR.lock() {
+        let path = dir.join("core.log");
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(f, "{msg}");
+        }
+    }
+}
+
+// ------------------------------------------------------------ asset overrides
+type AddAssetFn = unsafe extern "C" fn(*mut c_void, *const u8, usize, *const u8, usize);
+static ADD_ASSET: Lazy<Mutex<Option<GenericDetour<AddAssetFn>>>> =
+    Lazy::new(|| Mutex::new(None));
+
+/// (logical path, data ptr as usize, data len)
+static ASSET_OVERRIDES: Lazy<Mutex<Vec<(String, usize, usize)>>> =
+    Lazy::new(|| Mutex::new(Vec::new()));
+
+fn lookup_override(path: &str) -> Option<(*const u8, usize)> {
+    if let Ok(map) = ASSET_OVERRIDES.lock() {
+        for (p, ptr, len) in map.iter() {
+            if p == path {
+                return Some((*ptr as *const u8, *len));
+            }
+        }
+    }
+    None
+}
+
+unsafe extern "C" fn add_asset_hook(
+    this: *mut c_void,
+    path_ptr: *const u8,
+    path_len: usize,
+    data_ptr: *const u8,
+    data_len: usize,
+) {
+    let path = std::str::from_utf8(std::slice::from_raw_parts(path_ptr, path_len)).unwrap_or("");
+    let (dptr, dlen) = match lookup_override(path) {
+        Some((ptr, len)) => {
+            log(&format!("[assets] override {path} ({len} bytes)"));
+            (ptr, len)
+        }
+        None => (data_ptr, data_len),
+    };
+    if let Ok(guard) = ADD_ASSET.lock() {
+        if let Some(detour) = guard.as_ref() {
+            let _ = detour.call(this, path_ptr, path_len, dptr, dlen);
+        }
+    }
+}
+
+// -------------------------------------------------------------- frame hook
+type PeekMessageFn =
+    unsafe extern "system" fn(*mut MSG, windows::Win32::Foundation::HWND, u32, u32, u32) -> BOOL;
+static PEEK_MSG: Lazy<Mutex<Option<GenericDetour<PeekMessageFn>>>> =
+    Lazy::new(|| Mutex::new(None));
+
+fn now_ms() -> u64 {
+    unsafe {
+        let ft = GetSystemTimeAsFileTime();
+        let v = ((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64;
+        v / 10_000
+    }
+}
+
+unsafe extern "system" fn peek_message_hook(
+    msg: *mut MSG,
+    hwnd: windows::Win32::Foundation::HWND,
+    min: u32,
+    max: u32,
+    remove: u32,
+) -> BOOL {
+    let t = now_ms();
+    let last = LAST_TICK_MS.load(Ordering::Relaxed);
+    if t.saturating_sub(last) >= 16 {
+        LAST_TICK_MS.store(t, Ordering::Relaxed);
+        FRAME_COUNT.fetch_add(1, Ordering::Relaxed);
+        let dt = (t.saturating_sub(last)) as f64;
+        on_frame(dt);
+    }
+    if let Ok(guard) = PEEK_MSG.lock() {
+        if let Some(detour) = guard.as_ref() {
+            return detour.call(msg, hwnd, min, max, remove);
+        }
+    }
+    FALSE
+}
+
+fn on_frame(dt_ms: f64) {
+    let n = FRAME_COUNT.load(Ordering::Relaxed);
+    if n == 1 {
+        log("[core] first frame");
+    }
+    if let Ok(mut guard) = LUA.lock() {
+        if let Some(lua) = guard.as_mut() {
+            let _ = dispatch(lua, "_frame", dt_ms);
+        }
+    }
+}
+
+fn dispatch(lua: &Lua, table: &str, dt_ms: f64) -> mlua::Result<()> {
+    let tunnet: Table = lua.globals().get("tunnet")?;
+    let cbs: Table = tunnet.get(table)?;
+    for pair in cbs.pairs::<i64, Function>() {
+        let (_, f) = pair?;
+        if table == "_frame" {
+            f.call::<()>(dt_ms)?;
+        } else {
+            f.call::<()>(())?;
+        }
+    }
+    Ok(())
+}
+
+// ------------------------------------------------------------------ mods
+fn load_mods() {
+    let mods_dir = match CORE_DIR.lock() {
+        Ok(d) => d.join("mods"),
+        Err(_) => return,
+    };
+    if !mods_dir.is_dir() {
+        log(&format!("[mods] no mods dir at {}", mods_dir.display()));
+        return;
+    }
+
+    let lua = Lua::new();
+
+    // Build the `tunnet` API table.
+    let api = match lua.create_table() {
+        Ok(t) => t,
+        Err(e) => {
+            log(&format!("[mods] create_table failed: {e}"));
+            return;
+        }
+    };
+
+    let _ = api.set(
+        "log",
+        lua.create_function(|_, msg: String| {
+            log(&format!("[lua] {msg}"));
+            Ok(())
+        })
+        .unwrap(),
+    );
+
+    let _ = api.set(
+        "override_asset",
+        lua.create_function(|_, (logical, file): (String, String)| {
+            let base = CORE_DIR.lock().map(|d| d.clone()).unwrap_or_default();
+            let path = if std::path::Path::new(&file).is_absolute() {
+                PathBuf::from(&file)
+            } else {
+                base.join("mods").join(&file)
+            };
+            match std::fs::read(&path) {
+                Ok(bytes) => {
+                    let boxed = bytes.into_boxed_slice();
+                    let len = boxed.len();
+                    let leaked: &'static mut [u8] = Box::leak(boxed);
+                    let ptr = leaked.as_ptr() as usize;
+                    if let Ok(mut map) = ASSET_OVERRIDES.lock() {
+                        map.retain(|(p, _, _)| p != &logical);
+                        map.push((logical.clone(), ptr, len));
+                    }
+                    log(&format!(
+                        "[mods] override_asset {logical} <- {} ({len} bytes)",
+                        path.display()
+                    ));
+                    Ok(())
+                }
+                Err(e) => Err(mlua::Error::external(format!(
+                    "cannot read {}: {e}",
+                    path.display()
+                ))),
+            }
+        })
+        .unwrap(),
+    );
+
+    let load_cbs = lua.create_table().unwrap();
+    let frame_cbs = lua.create_table().unwrap();
+    let _ = api.set("_load", load_cbs);
+    let _ = api.set("_frame", frame_cbs);
+
+    let _ = api.set(
+        "on_load",
+        lua.create_function(|lua, f: Function| {
+            let tunnet: Table = lua.globals().get("tunnet")?;
+            let cbs: Table = tunnet.get("_load")?;
+            cbs.set(cbs.len()? + 1, f)
+        })
+        .unwrap(),
+    );
+    let _ = api.set(
+        "on_frame",
+        lua.create_function(|lua, f: Function| {
+            let tunnet: Table = lua.globals().get("tunnet")?;
+            let cbs: Table = tunnet.get("_frame")?;
+            cbs.set(cbs.len()? + 1, f)
+        })
+        .unwrap(),
+    );
+
+    let _ = lua.globals().set("tunnet", api);
+
+    // Load mods: each `mods/<name>/mod.lua`, plus flat `mods/*.lua`.
+    let mut files: Vec<PathBuf> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&mods_dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                let m = p.join("mod.lua");
+                if m.is_file() {
+                    files.push(m);
+                }
+            } else if p.extension().map(|x| x == "lua").unwrap_or(false) {
+                files.push(p);
+            }
+        }
+    }
+    files.sort();
+
+    for f in &files {
+        match std::fs::read_to_string(f) {
+            Ok(src) => match lua.load(&src).set_name(f.to_string_lossy()).exec() {
+                Ok(()) => log(&format!("[mods] loaded {}", f.display())),
+                Err(e) => log(&format!("[mods] error in {}: {e}", f.display())),
+            },
+            Err(e) => log(&format!("[mods] cannot read {}: {e}", f.display())),
+        }
+    }
+
+    // Fire on_load callbacks.
+    if let Err(e) = dispatch(&lua, "_load", 0.0) {
+        log(&format!("[mods] on_load dispatch error: {e}"));
+    }
+
+    log(&format!("[mods] {} mod file(s) loaded", files.len()));
+    *LUA.lock().unwrap() = Some(lua);
+}
+
+// ---------------------------------------------------------------- install
+unsafe fn module_base() -> usize {
+    GetModuleHandleW(PCWSTR::null())
+        .map(|h| h.0 as usize)
+        .unwrap_or(0)
+}
+
+unsafe fn install_asset_hook() {
+    let base = module_base();
+    let target = (base + RVA_ADD_ASSET) as *const ();
+    let orig: AddAssetFn = std::mem::transmute(target);
+    match GenericDetour::<AddAssetFn>::new(orig, add_asset_hook) {
+        Ok(d) => {
+            if let Err(e) = d.enable() {
+                log(&format!("[core] add_asset enable failed: {e}"));
+            } else {
+                log(&format!(
+                    "[core] add_asset hook installed @ {:#x}",
+                    target as usize
+                ));
+                *ADD_ASSET.lock().unwrap() = Some(d);
+            }
+        }
+        Err(e) => log(&format!("[core] add_asset detour failed: {e}")),
+    }
+}
+
+unsafe fn install_frame_hook() {
+    let user32 = LoadLibraryW(w!("user32.dll")).unwrap_or_default();
+    let Some(proc) = GetProcAddress(user32, s!("PeekMessageW")) else {
+        log("[core] PeekMessageW not found");
+        return;
+    };
+    let target = proc as usize as *const ();
+    let orig: PeekMessageFn = std::mem::transmute(target);
+    match GenericDetour::<PeekMessageFn>::new(orig, peek_message_hook) {
+        Ok(d) => {
+            if let Err(e) = d.enable() {
+                log(&format!("[core] PeekMessageW enable failed: {e}"));
+            } else {
+                log("[core] PeekMessageW hook installed");
+                *PEEK_MSG.lock().unwrap() = Some(d);
+            }
+        }
+        Err(e) => log(&format!("[core] PeekMessageW detour failed: {e}")),
+    }
+}
+
+fn core_dir_from_module(module: HMODULE) -> PathBuf {
+    let mut buf = vec![0u16; 1024];
+    let n = unsafe { GetModuleFileNameW(module, &mut buf) } as usize;
+    if n == 0 {
+        return PathBuf::from(".");
+    }
+    let s = String::from_utf16_lossy(&buf[..n]);
+    PathBuf::from(s)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn signal_ready() {
+    unsafe {
+        let pid = GetCurrentProcessId();
+        let name = format!("Local\\TunnetCoreReady_{pid}");
+        let name_w: Vec<u16> = std::ffi::OsStr::new(&name)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        if let Ok(ev) = OpenEventW(EVENT_MODIFY_STATE, false, PCWSTR(name_w.as_ptr())) {
+            let _ = SetEvent(ev);
+            let _ = CloseHandle(ev);
+            log("[core] signalled loader: ready");
+        } else {
+            log("[core] ready event not found");
+        }
+    }
+}
+
+unsafe fn init(module_usize: usize) {
+    let module = HMODULE(module_usize as *mut c_void);
+    *CORE_DIR.lock().unwrap() = core_dir_from_module(module);
+    LOG_READY.store(true, Ordering::Relaxed);
+    log("==================== tunnet-core attach ====================");
+    log(&format!("[core] module base = {:#x}", module_base()));
+    install_asset_hook();
+    install_frame_hook();
+    load_mods();
+    log("[core] init complete");
+    signal_ready();
+}
+
+// ----------------------------------------------------------------- DllMain
+#[no_mangle]
+#[allow(non_snake_case)]
+pub extern "system" fn DllMain(module: HMODULE, reason: u32, _reserved: *mut c_void) -> BOOL {
+    const DLL_PROCESS_ATTACH: u32 = 1;
+    if reason == DLL_PROCESS_ATTACH {
+        let m = module.0 as usize;
+        std::thread::spawn(move || unsafe { init(m) });
+    }
+    TRUE
+}

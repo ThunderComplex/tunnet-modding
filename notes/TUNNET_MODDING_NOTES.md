@@ -1,0 +1,387 @@
+# Tunnet — Reverse Engineering / Mod API Research Notes
+
+_Generated: 2026-10-05. Working copy: `G:\SteamLibrary\steamapps\common\Tunnet`_
+
+## 1. TL;DR
+
+- **Tunnet is a Rust game built on the Bevy game engine, version 0.7.0.**
+- It is shipped as a **single, statically-linked Windows executable** (`tunnet.exe`, ~90 MB) with **all game assets embedded into the binary** (`bevy_embedded_assets`). There is no external `assets/` folder.
+- The binary is **stripped of its symbol table and has no debug info**, BUT Bevy stores the Rust `type_name` of every system, component, event, and plugin at runtime, and those strings survive in the binary. We recovered **~625 game-owned symbols** (`tunnet::…`) — effectively a partial symbol map.
+- Game data (saves, settings, keybindings) is **plaintext JSON / TOML** in `%APPDATA%\tunnet\`. This is the easiest modding surface.
+- The game is cleanly organized into **Bevy plugins, one per feature** (e.g. `DigPlugin`, `DoorPlugin`, `RelayPlugin`, `EndpointPlugin`, `CablePlugin`, …), which is very favorable for a mod API.
+- There is **no scripting layer** (no Lua, no WASM). Mods must be native code (DLL injection / proxy DLL / binary patching) and/or data/asset replacement.
+
+## 2. How the engine was identified
+
+| Evidence | Conclusion |
+|---|---|
+| `LICENSES.txt` lists `bevy 0.7.0`, `bevy_ecs 0.7.0`, `bevy_render 0.7.0`, `wgpu 0.12.0`, `bevy_embedded_assets 0.2.1`, `bevy_kira_audio 0.8.0`, `heron 0.12.1` + `rapier3d 0.11.1`, `bevy_steamworks 0.4.0`, `bevy_text_mesh 0.1.0`, `transvoxel 0.1.1`, `egui 0.18.1` | Bevy 0.7 stack |
+| PE sections include `.eh_frame`, `.pdata`, `.xdata`; no `.pdb`; no symbol table (`nm` → "no symbols") | Rust, x86_64, stripped, no DWARF |
+| `strings` shows `/home/puzzled_squid/src/tunnet/src/*.rs` panic paths and `target/x86_64-pc-windows-gnu/release/…` | Built on Linux for the `x86_64-pc-windows-gnu` target; crate/package name `tunnet` |
+| `bevy_embedded_assets` in deps + no `assets/` folder on disk + raw PNG/Ogg/glTF signatures inside the exe | Assets are `include_bytes!`-embedded in `.rdata` |
+
+### Dependency highlights (from `LICENSES.txt`)
+- **Engine:** `bevy 0.7.0` (ecs, render/wgpu 0.12, pbr, sprite, ui, text, gltf, winit 0.26, gilrs).
+- **Assets embedded:** `bevy_embedded_assets 0.2.1`.
+- **Audio:** `bevy_kira_audio 0.8.0` + `kira 0.5.3`, `cpal`, `rodio` (mp3/ogg loaders).
+- **Physics:** `heron 0.12.1`, `heron_rapier`, `rapier3d 0.11.1`, `parry3d 0.7.1`.
+- **Terrain/voxels:** `transvoxel 0.1.1` / `transvoxel-data 0.2.1` (marching-cubes style voxel terrain).
+- **Steam:** `steamworks 0.9.0` + `bevy-steamworks 0.4.0` (achievements, etc.).
+- **UI/dev:** `egui 0.18.1` / `eframe` (likely debug overlay), `bevy_text_mesh` + `ttf2mesh`.
+- **Misc:** `serde`/`serde_json`/`ron`/`toml` (save + config), `image 0.23`, `gltf`, `noise 0.7`, `ureq`/`rustls` (HTTP — the in-game chatbot / "review" endpoint?).
+
+## 3. Architecture (recovered from `type_name` strings)
+
+The game is a Bevy `App` composed of feature plugins. Recovered game plugins include:
+
+```
+tunnet::net::endpoint::EndpointPlugin        tunnet::net::relay::RelayPlugin
+tunnet::net::cable::CablePlugin              tunnet::net::transport::TransportPlugin
+tunnet::net::build::NetBuildingPlugin        tunnet::net::bridge::BridgePlugin
+tunnet::net::filter::FilterConfig            tunnet::net::errors::ErrorPlugin
+tunnet::net::hub::HubPlugin                  tunnet::net::debug::NetDebugPlugin
+tunnet::net::pc::PersonalComputerPlugin      tunnet::net::tester::…
+tunnet::map::dig::DigPlugin                  tunnet::map::edit::EditPlugin
+tunnet::map::water::WaterPlugin              tunnet::map::MapPlugin
+tunnet::map::chunks::objects::door::DoorPlugin
+tunnet::map::chunks::objects::sign::SignPlugin
+tunnet::map::chunks::objects::cart::CartPlugin
+tunnet::npc::hearing::HearingPlugin          tunnet::npc::wandering::WanderingPlugin
+tunnet::npc::path_finding::PathFindingPlugin tunnet::npc::photophobia::PhotophobiaPlugin
+tunnet::npc::hide::HidePlugin                tunnet::npc::shy::ShyPlugin
+tunnet::npc::stalk::StalkPlugin
+```
+
+Representative systems / components / events (all names are exact Rust paths):
+
+- **Player / movement:** `player.rs`, `movement.rs` (`movement`, `jetpack`, footsteps), `tunnet::player::JetPackLight`.
+- **Network gameplay (core loop):** `net::endpoint`, `relay`, `hub`, `filter`, `tester`, `cable`, `bridge`, `antenna`, `transport`, `proto`, `infection`, `pc`, `monitor`, `build`, `debug`. Systems: `tunnet::net::transport::tick`, `tunnet::net::animate_cable`, `tunnet::net::build::update_wire_preview`, etc.
+- **World:** `map::chunk` (`Chunk`, `DirtyChunk`, `generate_meshes`), `map::terrain` (`Permanent`, `AudioState`), `map::voxel`, `map::water`, `map::dig` (`Diggable`, `ExplosionEvent`), `map::bunker`, `map::chunks::supermarket`, `map::edit`.
+- **NPCs:** `npc::chase`, `hearing`, `hide`, `hit`, `path_finding`, `photophobia`, `shy`, `stalk`, `wandering`.
+- **Meta:** `save`, `settings`, `menu`, `pause`, `hud`, `inventory`, `knowledge` (journal), `dialog`, `manual`, `shop`, `loot`, `grab`, `compass`, `booth`, `credits`, `end_credits`, `review`, `boss`, `death`, `home`, `surface`, `particle`, `postprocessing`, `tweening`, `achievement`, `earthquake`, `audio`.
+- **Story:** `tunnet::story::Story` resource, with a `state` enum (values seen in saves: e.g. `ConnectToShelters`, `InfectMainframeWithAB`, …).
+
+### Recovered source module tree (game-owned)
+```
+src/main.rs  src/save.rs  src/settings.rs  src/menu.rs  src/pause.rs
+src/hud.rs  src/input.rs  src/dialog.rs  src/manual.rs  src/knowledge.rs
+src/inventory.rs  src/tools.rs  src/shop.rs  src/loot.rs  src/grab.rs
+src/compass.rs  src/booth.rs  src/credits.rs  src/end_credits.rs  src/review.rs
+src/death.rs  src/boss.rs  src/home.rs  src/surface.rs  src/particle.rs
+src/postprocessing.rs  src/tweening.rs  src/movement.rs  src/player.rs
+src/audio.rs  src/achievement.rs  src/earthquake.rs  src/story.rs
+src/map.rs + map/{chunk,terrain,voxel,water,dig,bunker,edit,core,core/raw}.rs
+src/map/chunks/{objects,objects/cart,objects/door,objects/sign,supermarket}.rs
+src/net.rs + net/{endpoint,relay,hub,filter,tester,cable,bridge,antenna,
+                   transport,proto,infection,pc,monitor,build,debug}.rs
+src/npc.rs + npc/{chase,hearing,hide,hit,path_finding,photophobia,shy,stalk,wandering}.rs
+```
+
+## 4. Assets
+
+- Embedded in the exe via `include_bytes!` (raw, not compressed by the packer).
+- Asset namespaces seen in strings: `textures/…png`, `snd/…ogg` (incl. `snd/songs/…`), `models/…glb#Scene0` / `…#AnimationN` (glTF scenes/animations), `shaders/monitor.wgsl`, `fonts/…`.
+- **No external asset folder** → asset modding requires either (a) binary patching/repacking the embedded bytes, or (b) runtime interception of `bevy_asset` loads.
+- `bevy_embedded_assets` registers an in-memory `AssetIo` source; the game reads assets from a static directory baked into `.rdata`.
+
+## 5. Persistent data (easy modding surface)
+
+Location: **`%APPDATA%\tunnet\`** (i.e. `C:\Users\<user>\AppData\Roaming\tunnet`).
+
+| File | Format | Notes |
+|---|---|---|
+| `slot_0.json`, `slot_1.json`, `slot_2.json` | JSON | Save slots. Large (1–4 MB). |
+| `auto` | JSON | Autosave (`auto_save_interval`). |
+| `settings.toml` | TOML | `safe`, `placement_preview`, `leaderboard`, `photosensitive`, `arachnophobia`, `dig_anywhere`. |
+| `system_settings.toml` | TOML | `ssao`, `sensitivity`, `volume`, `music`, `fullscreen`, `invert_x`, `invert_y`, `vsync`. |
+| `key_bindings.toml` | TOML | `user_cfg = [[Action, Key], …]`. |
+| `steam_autocloud.vdf` | VDF | Steam Cloud bookkeeping. |
+
+### Save schema (from `slot_0.json` + `struct Save`/`struct PlayerSave` serde metadata)
+Top-level `Save` (15 fields):
+```
+player, story, nodes, edges, endpoints, relays, filters, testers,
+hubs, antennas, bridges, chunk_types, chunks, toolboxes, pages
+```
+`player`: `{ pos:[x,y,z], credits:int }`
+
+`story` (partial, ~45 fields):
+```
+state, digging, relay, hub, filter, scan_short, scan_long, connection_status,
+streaks, mainframes, jetpack, antivirus, sprint, optical_fiber, antenna, surface,
+companion, shop_level, disinfected, disinfection_dialog, movement, look, tester,
+military_cleared, luxury_cleared, monastry_cleared, researchlab_cleared,
+inventory, knowledge, visited_chunks, map_annotations, boss_phase, page_no, pages,
+review, auto_map, relay_light, home, patch, filter_collision, filter_full_address,
+tester_repeat, tester_spoof, tester_snoop, scan_short_enhanced, scan_long_peers,
+antivirus_v2
+```
+Save/load uses **serde_json** (`src/save.rs`, `load_slot`, `Cannot open save file` / `Corrupted save file`).
+
+## 6. Build / binary facts
+
+- Target: `x86_64-pc-windows-gnu` (MinGW), built on Linux at `/home/puzzled_squid/src/tunnet`.
+- Release build; **stripped**, no PDB, no DWARF.
+- Sections: `.text` ~37.7 MB, `.rdata` ~49 MB (contains embedded assets + strings), `.pdata`/`.xdata` (SEH), `.reloc`.
+- `bevy_dynamic_plugin` and `bevy_dylib` are present in the dependency list (Bevy default workspace members), so **dynamic plugin support code exists in the binary** — but no evidence the game actually loads external plugins.
+- Steam integration: `steam_api64.dll` present; achievements via `bevy_steamworks`.
+- CLI flag found: `--bypass-launcher` (the shipped Steam build has no launcher exe, so likely inert here).
+
+## 7. Modding approaches (initial assessment)
+
+| Approach | Difficulty | What it enables | Notes |
+|---|---|---|---|
+| **Save / config editing** | Easy | Cheats, unlock flags, story state, keybinds, graphics | Plaintext JSON/TOML. Highest ROI to start. |
+| **Asset replacement via exe repack** | Medium | Textures, sounds, models, shaders | Assets are raw embedded bytes in `.rdata`; need to locate offsets and rebuild/relink sections. |
+| **Proxy DLL (e.g. `steam_api64.dll`) or DLL injection** | Medium–Hard | Native in-process code, hooking, custom systems | Best route to a real "mod API". Requires ABI knowledge of the running Bevy `App`/`World`. |
+| **Runtime ECS hooking** | Hard | Add components/systems, alter gameplay | Locate game systems by signature/`type_name`; call into Bevy 0.7 internals. Version-locked to Bevy 0.7. |
+| **Static binary patching** | Medium–Hard | Constants, feature flags, small behavior changes | No symbols; use string/`type_name` cross-references as anchors. |
+| **`bevy_dynamic_plugin`** | Hard | Clean Rust plugin loading | Requires patching `main` to load a plugin and matching Bevy 0.7 exactly. |
+
+Key constraints for a mod API:
+1. **No scripting layer** → mods are native or data-only.
+2. **Assets embedded** → no drop-in asset folder.
+3. **Bevy 0.7 is old** and ABI/type-layout-sensitive; a native mod must compile against the exact same crate versions.
+4. **Reflection** exists for Bevy types but **the game's own components do not appear to be `#[derive(Reflect)]`-registered** (their names appear only via Bevy's `type_name` system labels, not the `TypeRegistry`), so runtime reflection-based modding of game types is limited.
+
+## 8. Open research tasks (TODO)
+
+- [ ] Confirm whether the game registers any game types in `TypeRegistry` (search for `tunnet::…` inside registry dumps at runtime).
+- [x] Map the embedded asset index (see section 10) — **DONE**: 608 assets, exact path→offset/size, extracted.
+- [ ] Locate the game's `App::build()` / plugin registration to identify a stable injection point.
+- [ ] Determine if `bevy_dynamic_plugin` is actually reachable.
+- [ ] Identify the in-game chatbot/`review` HTTP endpoint (`ureq`/`rustls`) — could be a hook point or just telemetry.
+- [ ] Recover the `story.state` enum's full set of variants (from save snapshots + strings).
+- [ ] Check whether the itch.io / GOG / other builds differ (they may be unstripped or have external assets).
+- [ ] Decide mod distribution: proxy DLL vs patcher vs save editor.
+
+## 9. Tooling available on this machine
+
+- `C:\mingw64\bin\strings.exe`, `nm.exe`, `objdump.exe`, `objcopy.exe`, `readelf.exe`.
+- Extracted string dump: `C:\Users\THUNDE~1\AppData\Local\Temp\opencode\tunnet_strings.txt`.
+- Extracted `tunnet::` symbol list: `C:\Users\THUNDE~1\AppData\Local\Temp\opencode\tunnet_symbols.txt` (~625 entries).
+
+---
+
+## 10. Embedded asset map — SOLVED (2026-10-05)
+
+### Mechanism
+`bevy_embedded_assets 0.2.1` uses a build script that generates
+`include_all_assets(embedded: &mut EmbeddedAssetIo)` containing one
+`embedded.add_asset(Path::new(<relpath>), include_bytes!(<abspath>))` per file
+under the build-time `assets/` directory. In the release binary this function is
+**not** inlined.
+
+### Key addresses (this exact build)
+| Symbol | VA | Notes |
+|---|---|---|
+| `include_all_assets()` | `0x1408202c0` | 608 `add_asset` calls; ends `0x140825aa5` |
+| `EmbeddedAssetIo::add_asset()` | `0x14081fa10` | called once per asset |
+| `.rdata` region holding the table | ~`0x1424b2d***` onward | interleaved `[path][data]` |
+
+### Layout
+The `.rdata` asset region is **contiguous**: for each asset, the relative path
+string literal is immediately followed by its file bytes:
+
+```
+[ "man/17.png" (10 bytes) ][ PNG bytes (7013) ][ "man/24.png" ][ PNG bytes ] ...
+```
+
+Each call is compiled as (Windows x64 method ABI):
+```
+movq $<data_len>, 0x20(%rsp)   ; data.len
+lea  <path_ptr>(%rip), %rdx    ; path.ptr
+lea  <data_ptr>(%rip), %r9     ; data.ptr   (may be `mov %reg,%r9` when reused)
+mov  $<path_len>, %r8d         ; path.len
+mov  %rsi, %rcx                ; self
+call 0x14081fa10               ; add_asset
+```
+Identical files can share a data array (register reuse), e.g. `man/02.png` and
+`man/04.png`.
+
+### Result
+- **608 assets**, exact `path → (file offset, length)` recovered and validated
+  (container size == table length for all PNG/OGG/GLB; 0 mismatches).
+- 42.9 MB of assets extracted to `assets_extracted/`.
+- Inventory: `textures/` 179 PNG, `man/` 53 PNG, `snd/` 174 OGG,
+  `models/` 196 GLB, `shaders/` 4 WGSL, `fonts/` 2 (TTF; `.attf` duplicate),
+  `textures/icon.ico`, `models/medusa` (GLB with no extension).
+
+### Artifacts
+- `data/asset_table.json` / `data/asset_table.csv` — the exact 608-entry table.
+- `assets_extracted/` — all original assets on disk (reference/replacement base).
+- `analysis/map_assets.py`, `map_assets2.py`, `scan_paths.py`,
+  `find_include_all.py`, `parse_iaa.py`, `extract_assets.py`.
+
+### Implications for the mod API
+- **Asset replacement is fully viable**: overwrite the bytes at each
+  `data_off` (same length) for a static repack, or intercept at runtime.
+- **Best runtime hook target:** `EmbeddedAssetIo::load_path_sync` (or the
+  `AssetIo` trait vtable) so a proxy DLL can substitute bytes by asset path
+  without touching the exe. `add_asset` (`0x14081fa10`) is a secondary anchor.
+- The recovered table can seed a manifest-driven asset mod format
+  (`path` → replacement file), independent of exe offsets.
+
+---
+
+## 11. Injection points & launch architecture (2026-10-05)
+
+### Decision
+Mods are **not** distributed as DLLs. Ship:
+1. **Modloader exe** — launches `tunnet.exe`, injects the core, passes mod list.
+2. **Core DLL** (`core.dll`) — the only native artifact; exposes a C-ABI mod API
+   and hosts the scripting runtime.
+3. **Mods** — manifests + scripts (Lua/WASM) and/or asset/data files.
+
+Injection: `CreateProcess(tunnet.exe, ..., CREATE_SUSPENDED)` →
+`VirtualAllocEx`/`WriteProcessMemory`/`CreateRemoteThread(LoadLibraryW, core.dll)`
+→ `ResumeThread`. This avoids touching `steam_api64.dll`, keeps Steamworks and
+the overlay intact, and survives game updates.
+
+### Binary anchors recovered (this exact build)
+| Anchor | VA | Use |
+|---|---|---|
+| PE entry (`mainCRTStartup`) | `0x1400014b0` | startup |
+| `__tmainCRTStartup` | `0x140001180` | CRT; stores `main` ptr in global `0x14564b160` |
+| `main` shim | `0x140001000` | (1-byte `ret`; Rust entry is wired via `lang_start`) |
+| `EmbeddedAssetIo::add_asset` | `0x14081fa10` | asset table build |
+| `include_all_assets` | `0x1408202c0` | asset registration (608 calls) |
+| per-plugin `name()` thunks | `0x1404e0ce0`… | one per game plugin; returns type_name `&str` |
+| `Tunnet Crash Reporter` site | `0x14038cc60` | crash handler |
+
+### What is hard
+- **No symbols, no DWARF**, heavy inlining. Many strings (incl. config paths and
+  the window title) are reached through **static pointer tables**, not code LEAs,
+  so naive xref misses them.
+- Game types are **not** in Bevy's `TypeRegistry` (saves use serde), so no
+  reflection-based access to game components.
+- `main` does not appear as a normal callable function; the Rust entry is passed
+  to `lang_start`. Pinning `App::run` / `Schedule::run` requires more RE.
+
+### Recoverable anchors for game functions
+- Bevy stores `type_name` for every system/component/event; ~625 game symbols
+  were recovered. Each game system's registration references its type_name, and
+  each source file's panic `Location` lives in a `.rdata` table (e.g. 63 entries
+  for `bevy_winit/src/lib.rs`). These give us offline **byte-pattern + xref
+  signatures** to locate specific systems per build.
+
+### Recommended path (MVP → full)
+- **MVP (no Bevy ABI):** core hooks, by signature, the asset load path
+  (`EmbeddedAssetIo::load_path_sync`), the save/load path (serde_json in
+  `save.rs`), and one per-frame + one startup game system. Mods are scripts that
+  register callbacks. Covers asset replacement, save/config/cheats, and many
+  gameplay tweaks.
+- **Full (Bevy ABI bridge):** locate and hook a schedule entry (`App::run` /
+  `Schedule::run` / `World::run_schedule`) to obtain the `World` and inject a
+  mod `Plugin` compiled against the exact Bevy 0.7 versions. Highest power;
+  highest fragility (must match Bevy 0.7 layout/features).
+- **Tooling note:** a reference Bevy 0.7 build for signature diffing is risky
+  (Bevy 0.7 predates the installed Rust 1.97); prefer offline signatures derived
+  from this binary + Bevy 0.7 source.
+
+### Open questions
+- Which Bevy 0.7 functions can be pinned reliably without a reference build?
+- Exact `AssetIo` vtable location for `load_path_sync` hooking.
+- Whether a stable per-frame game system exists with a simple signature.
+- Scripting runtime choice: Lua (mlua) vs WASM (wasmtime) for mod scripts.
+
+---
+
+## 12. MVP hook plan (chosen) — hook-based, Lua mods
+
+Decisions: **MVP hook-based first, then ECS bridge**; mods scripted in **Lua
+(mlua)**. Modloader exe + injected `core.dll`; mods are data/scripts, never DLLs.
+
+### Hook 1 — assets: detour `EmbeddedAssetIo::add_asset` @ `0x14081fa10`
+Called **608×** during `EmbeddedAssetIo::preloaded()` (before `main` builds the
+`App`), once per asset, with the asset path and its bytes. Detouring it lets us
+substitute bytes by path at startup. Calling convention (Win x64):
+
+```
+rcx = self (&mut EmbeddedAssetIo)
+rdx = path.ptr      r8 = path.len
+r9  = data.ptr      [rsp+0x20] = data.len
+```
+Equivalent Rust: `fn(&mut self, path: &Path, data: &[u8])`.
+A detour reads `path`, looks up a mod override, and calls the trampoline with a
+leaked replacement `&'static [u8]` (or the original). No need to hook
+`load_path_sync` for asset replacement.
+
+### Hook 2 — per-frame: detour a Win32 message API
+Bevy 0.7/winit pumps messages on the main thread every frame. Detour
+`PeekMessageW` (user32) and run mod `on_frame` callbacks throttled to ~60 Hz.
+This gives a reliable main-thread tick **without** any Bevy internals, and is
+replaced/augmented later by the ECS bridge.
+
+### Hook 3 — startup: first `add_asset` call or a one-shot flag in the frame hook
+Mods get an `on_start` after assets are registered.
+
+### Hook 4 — config/save: pre-launch file patching (no hook)
+The loader/core runs before the game reads `%APPDATA%\tunnet\*.json|*.toml`, so
+mods can patch saves/settings/keybinds on disk. Runtime save interception (file
+API detours) is a later add-on.
+
+### Deferred — ECS bridge
+Later, pin `App::run` / `Schedule::run` / `World::run_schedule` to obtain the
+`World` and inject a mod `Plugin` compiled against Bevy 0.7. Until then,
+gameplay mods use the frame hook + any game-function detours located by
+signature.
+
+### Module layout (planned)
+```
+tunnet-modding/
+  loader/        # modloader exe: CreateProcess(SUSPENDED) + inject core.dll
+  core/          # injected cdylib: hooks, Lua runtime, C-ABI mod API
+  sdk/           # Rust/Lua mod SDK + manifest schema
+  mods/          # example mods
+  analysis/      # RE tooling (this)
+  data/          # recovered tables/symbols
+  notes/         # this file
+```
+
+---
+
+## 13. MVP implementation status — WORKING (2026-10-05)
+
+Toolchain: `x86_64-pc-windows-gnu` + MinGW gcc 13.2 (`.cargo/config.toml`).
+
+### Built and verified end-to-end
+```
+tunnet-loader.exe   launches tunnet.exe SUSPENDED (with --bypass-launcher),
+                    injects core.dll via CreateRemoteThread(LoadLibraryW),
+                    waits for the core "ready" event, then resumes.
+core.dll            installs add_asset + PeekMessageW detours (retour),
+                    embeds Lua 5.4 (mlua, vendored), loads mods.
+mods/<name>/mod.lua Lua mod: tunnet.log/on_load/on_frame/override_asset.
+```
+
+### Startup race fix
+The game can call `add_asset` before an async init thread registers overrides.
+Handshake: loader creates `Local\TunnetCoreReady_<pid>` and waits (15 s) before
+`ResumeThread`; the core sets it after hooks + mods are ready. The game's main
+thread stays suspended the whole time, so overrides are always in place.
+
+### Verified log (real run)
+```
+[core] add_asset hook installed @ 0x7ff6f6f3fa10
+[core] PeekMessageW hook installed
+[lua] example mod: loaded
+[mods] override_asset textures/puzzled_squid.png <- .../mods/example/puzzled_squid.png (487 bytes)
+[lua] example mod: on_load
+[core] signalled loader: ready
+[assets] override textures/puzzled_squid.png (487 bytes)   <-- hook substituted bytes
+[lua] example mod: 60 frames (last dt=25.00 ms)            <-- per-frame Lua
+```
+
+### Notes / gotchas
+- Run the game with `--bypass-launcher` (loader adds it) or it relaunches itself
+  and the injected process is the wrong one.
+- `add_asset` ABI: `rcx=self, rdx=path.ptr, r8=path.len, r9=data.ptr, [rsp+0x20]=data.len`.
+- The detour addresses are RVAs (`0x81fa10`), resolved against the runtime module
+  base (ASLR-safe).
+- `PeekMessageW` tick is throttled to ~16 ms on the main thread.
+
+### Next
+- Save/config pre-launch patching; runtime file-API detours.
+- ECS bridge (App/Schedule hook) for gameplay + new content + UI.
+- Harden signatures against game updates (signature DB from this build).
