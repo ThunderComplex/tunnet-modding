@@ -42,8 +42,17 @@ tunnet.on_update(function()
             tostring(tunnet.story_unlock("digging")),
             tostring(tunnet.story_unlock("jetpack"))))
         local b = tunnet.asset_bytes("textures/example_new.png")
-        tunnet.log(string.format("example mod: new asset bytes = %s",
-            b and #b or "nil"))
+        tunnet.log(string.format("example mod: new asset bytes = %s", b and #b or "nil"))
+        tunnet.log(string.format("example mod: entity_count = %d", tunnet.entity_count()))
+        local pp = tunnet.player_pos()
+        tunnet.log(string.format("example mod: player_pos = %s",
+            pp and string.format("(%.2f, %.2f, %.2f)", pp.x, pp.y, pp.z) or "nil"))
+        for _, n in ipairs(tunnet.components()) do
+            local sz = tunnet.component_size(n)
+            if sz == 320 or n:find("player") or n:find("movement") then
+                tunnet.log(string.format("example mod: size(%s) = %d", n, sz))
+            end
+        end
         -- Writes (uncomment to try):
         -- tunnet.set_credits(999)
         -- tunnet.set_story_unlock("jetpack", true)

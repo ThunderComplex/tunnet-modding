@@ -14,7 +14,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import common
 
-args = common.common_parser("Trace a panic piece to its panic site.").parse_args()
+args = common.common_parser(
+    "Trace a panic piece to its panic site.",
+    positional={"name": "needle", "nargs": "?", "help": "format-string piece"},
+).parse_args()
 EXE = common.resolve_exe(args.exe)
 d = EXE.read_bytes()
 
@@ -85,7 +88,7 @@ def code_lea_refs(target_va):
         i += 1
     return out
 
-needle = sys.argv[1].encode("latin1") if len(sys.argv) > 1 else b" does not exist in the `World`"
+needle = (args.needle if args.needle else " does not exist in the `World`").encode("latin1")
 sv = []
 i = 0
 while True:

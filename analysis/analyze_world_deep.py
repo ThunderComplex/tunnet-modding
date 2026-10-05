@@ -3,7 +3,15 @@
 import struct, sys, re
 from pathlib import Path
 
-p = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(r"H:\dev\Rust\tunnet-modding\deploy-test\world_deep.bin")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import common
+
+args = common.common_parser(
+    "Parse the tagged two-level World dump and locate type-name strings.",
+    positional={"name": "dump", "nargs": "?",
+                "help": "world_deep.bin (default <repo>/data/world_deep.bin)"},
+).parse_args()
+p = Path(args.dump) if args.dump else common.resolve_data(args.data) / "world_deep.bin"
 d = p.read_bytes()
 world = struct.unpack_from("<Q", d, 0)[0]
 print(f"world=0x{world:x} file={len(d)}")

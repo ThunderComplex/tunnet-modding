@@ -22,7 +22,7 @@ use windows::Win32::System::LibraryLoader::{
 };
 use windows::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
 use windows::Win32::System::Memory::{
-    VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT,
+    VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_PRIVATE,
 };
 use windows::Win32::System::Threading::{
     GetCurrentProcessId, OpenEventW, SetEvent, EVENT_MODIFY_STATE,
@@ -284,6 +284,281 @@ unsafe fn read_u64_at(a: usize) -> u64 {
     std::ptr::read_unaligned(a as *const u64)
 }
 
+/// Scan committed, readable process memory for a little-endian `(f32,f32,f32)`
+/// triple and return its address (0 if not found). Useful for locating things
+/// like the player's `Transform.translation`.
+/// Player position pointer, via a Cheat Engine pointer-scan chain rooted in
+/// `tier0_s64.dll` (see notes §20). Offsets are for the current Steam build.
+static LAST_TARGET: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
+static APP_PTR: AtomicUsize = AtomicUsize::new(0);
+static CHAINS: Lazy<Mutex<Vec<Vec<usize>>>> = Lazy::new(|| Mutex::new(Vec::new()));
+
+fn load_chains() {
+    let path = match CORE_DIR.lock() {
+        Ok(d) => d.join("chains.txt"),
+        Err(_) => return,
+    };
+    let s = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let mut v = Vec::new();
+    for line in s.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let offs: Vec<usize> = line
+            .split(',')
+            .filter_map(|t| usize::from_str_radix(t.trim().trim_start_matches("0x"), 16).ok())
+            .collect();
+        if !offs.is_empty() {
+            v.push(offs);
+        }
+    }
+    log(&format!("[pos] loaded {} chains from chains.txt", v.len()));
+    *CHAINS.lock().unwrap() = v;
+}
+
+
+/// Find where a target address is referenced: scan the World and every
+/// resource for a pointer `p` with `p <= addr < p + 128MB`.
+unsafe fn search_ptr(addr: usize) -> Vec<(String, usize)> {
+    let world = WORLD_PTR.load(Ordering::Relaxed);
+    let mut out = Vec::new();
+    if world == 0 || addr == 0 {
+        return out;
+    }
+    for o in (0..0x1000).step_by(8) {
+        let p = read_u64_at(world + o) as usize;
+        if p >= 0x10000 && addr >= p && addr.wrapping_sub(p) < 0x8000000 && is_readable(p, 8) {
+            out.push((format!("world+{o:#x}"), p));
+        }
+    }
+    for name in component_names(world) {
+        if let Some(cid) = component_id(world, &name) {
+            let rp = resource_ptr(world, cid);
+            if rp < 0x10000 || !is_readable(rp, 0x100) {
+                continue;
+            }
+            for o in (0..0x100).step_by(8) {
+                let p = read_u64_at(rp + o) as usize;
+                if p >= 0x10000 && addr >= p && addr.wrapping_sub(p) < 0x8000000 && is_readable(p, 8)
+                {
+                    out.push((format!("{name}+{o:#x}"), p));
+                }
+            }
+        }
+    }
+    // Deep scan intentionally removed (it could stall/crash); see notes §20.
+    let _ = addr;
+    out
+}
+
+fn check_target() {
+    let path = match CORE_DIR.lock() {
+        Ok(d) => d.join("target.txt"),
+        Err(_) => return,
+    };
+    let s = match std::fs::read_to_string(&path) {
+        Ok(s) => s.trim().to_string(),
+        Err(_) => return,
+    };
+    if s.is_empty() {
+        return;
+    }
+    let changed = LAST_TARGET.lock().map(|l| *l != s).unwrap_or(false);
+    if !changed {
+        return;
+    }
+    if let Ok(mut l) = LAST_TARGET.lock() {
+        *l = s.clone();
+    }
+    let hex = s.trim_start_matches("0x").trim();
+    if let Ok(addr) = usize::from_str_radix(hex, 16) {
+        let res = unsafe { search_ptr(addr) };
+        log(&format!("[search] target {addr:#x}: {} candidates", res.len()));
+        for (loc, p) in res.iter().take(40) {
+            log(&format!(
+                "[search]   {loc} -> {p:#x}  (addr-p={:#x})",
+                addr.wrapping_sub(*p)
+            ));
+        }
+    }
+}
+
+unsafe fn player_pos_ptr() -> usize {
+    let base = GetModuleHandleW(w!("tier0_s64.dll"))
+        .map(|h| h.0 as usize)
+        .unwrap_or(0);
+    if base == 0 {
+        return 0;
+    }
+    // Decoded CE pointer-scan paths (moduleoff, offsets in file order; applied
+    // in reverse). See notes §20.
+    let chains: &[(usize, [usize; 5])] = &[
+        (0xff450, [0x350, 0x68, 0xf08, 0x148, 0x138]),
+        (0xff450, [0x280, 0x2c0, 0x80, 0x1c0, 0x138]),
+        (0xff450, [0x280, 0xa0, 0x3c8, 0x148, 0x138]),
+        (0xff450, [0x280, 0x1b0, 0x60, 0x1c0, 0x138]),
+        (0xff450, [0x280, 0x1b0, 0xc98, 0x148, 0x138]),
+        (0xff450, [0x280, 0x2c0, 0x12c8, 0x148, 0x138]),
+        (0xff450, [0x830, 0xa0, 0xf08, 0x148, 0x138]),
+        (0xcf2b0, [0x1050, 0x378, 0x15c8, 0x8, 0x2b0]),
+        (0xcf2b0, [0x1050, 0x378, 0x15c8, 0x8, 0x3c0]),
+        (0xcf2b0, [0x1050, 0x378, 0x15c8, 0x8, 0x4e0]),
+        (0xcf2b0, [0x1050, 0x378, 0x15c8, 0x8, 0x5f0]),
+        (0xcf2b0, [0x12c0, 0x320, 0x15c8, 0x8, 0x2b0]),
+        (0xcf2b0, [0x12c0, 0x320, 0x15c8, 0x8, 0x3c0]),
+        (0xcf2b0, [0x12c0, 0x320, 0x15c8, 0x8, 0x4e0]),
+        (0xcf2b0, [0x12c0, 0x320, 0x15c8, 0x8, 0x5f0]),
+    ];
+    let dbg = std::env::var("TUNNET_DEBUG_POS").is_ok();
+    let mut first_ok = 0usize;
+    for (mo, offs) in chains {
+        for (rev, label) in [(true, "rev"), (false, "fwd")] {
+            let mut a = base + mo;
+            let mut ok = true;
+            let seq: Vec<usize> = if rev {
+                offs.iter().rev().copied().collect()
+            } else {
+                offs.to_vec()
+            };
+            for off in &seq {
+                if !is_readable(a, 8) {
+                    ok = false;
+                    if dbg && *mo == 0xff450 && offs[4] == 0x138 {
+                        log(&format!("[pos] {label} unreadable {a:#x} (off {off:#x})"));
+                    }
+                    break;
+                }
+                let v = read_u64_at(a) as usize;
+                if dbg && *mo == 0xff450 && offs[4] == 0x138 {
+                    log(&format!("[pos] {label} {a:#x} -> {v:#x} +{off:#x}"));
+                }
+                a = v.wrapping_add(*off);
+            }
+            if ok && is_readable(a, 12) {
+                let (x, y, z) = (
+                    std::ptr::read_unaligned(a as *const f32),
+                    std::ptr::read_unaligned((a + 4) as *const f32),
+                    std::ptr::read_unaligned((a + 8) as *const f32),
+                );
+                if dbg {
+                    log(&format!(
+                        "[pos] {label} mo={mo:#x} offs={offs:x?} -> {a:#x} = ({x:.2},{y:.2},{z:.2})"
+                    ));
+                }
+                if x.abs() < 100000.0
+                    && y.abs() < 100000.0
+                    && z.abs() < 100000.0
+                    && (x != 0.0 || y != 0.0 || z != 0.0)
+                    && first_ok == 0
+                {
+                    first_ok = a;
+                }
+            } else if dbg {
+                log(&format!("[pos] {label} mo={mo:#x} offs={offs:x?} -> FAILED"));
+            }
+        }
+    }
+    // Brute-force the decoded stack chains as World/App-relative suffixes.
+    let chains = CHAINS.lock().map(|c| c.clone()).unwrap_or_default();
+    let bases = [
+        ("world", WORLD_PTR.load(Ordering::Relaxed)),
+        ("app", APP_PTR.load(Ordering::Relaxed)),
+    ];
+    for (bname, b0) in bases {
+        if b0 == 0 {
+            continue;
+        }
+        for offs in &chains {
+            for k in 0..offs.len() {
+                for rev in [true, false] {
+                    let mut a = b0;
+                    let mut ok = true;
+                    let seq: Vec<usize> = if rev {
+                        offs[k..].iter().rev().copied().collect()
+                    } else {
+                        offs[k..].to_vec()
+                    };
+                    for off in &seq {
+                        if !is_readable(a, 8) {
+                            ok = false;
+                            break;
+                        }
+                        a = (read_u64_at(a) as usize).wrapping_add(*off);
+                    }
+                    if ok && is_readable(a, 12) {
+                        let (x, y, z) = (
+                            std::ptr::read_unaligned(a as *const f32),
+                            std::ptr::read_unaligned((a + 4) as *const f32),
+                            std::ptr::read_unaligned((a + 8) as *const f32),
+                        );
+                        if x.abs() < 1.0e6
+                            && y.abs() < 1.0e6
+                            && z.abs() < 1.0e6
+                            && (x != 0.0 || y != 0.0 || z != 0.0)
+                        {
+                            if dbg {
+                                log(&format!(
+                                    "[pos] {bname} k={k} rev={rev} offs={offs:x?} -> {a:#x} = ({x:.2},{y:.2},{z:.2})"
+                                ));
+                            }
+                            if first_ok == 0 {
+                                first_ok = a;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    first_ok
+}
+
+unsafe fn find_vec3(x: f32, y: f32, z: f32, tol: f32) -> usize {
+    let mut addr = 0x10000usize;
+    let mut scanned: usize = 0;
+    let budget: usize = 64 * 1024 * 1024;
+    while addr < 0x7fff_ffff_0000 && scanned < budget {
+        let mut mbi = MEMORY_BASIC_INFORMATION::default();
+        let r = VirtualQuery(
+            Some(addr as *const c_void),
+            &mut mbi,
+            std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+        );
+        if r == 0 {
+            break;
+        }
+        let base = mbi.BaseAddress as usize;
+        let size = mbi.RegionSize;
+        let prot = mbi.Protect.0 & 0xFF;
+        let readable = matches!(prot, 0x02 | 0x04 | 0x08 | 0x20 | 0x40 | 0x80);
+        if mbi.State == MEM_COMMIT
+            && mbi.Type == MEM_PRIVATE
+            && readable
+            && (mbi.Protect.0 & 0x100) == 0
+        {
+            let end = base.saturating_add(size);
+            let mut i = base;
+            while i + 12 <= end {
+                let v0 = std::ptr::read_unaligned(i as *const f32);
+                if (v0 - x).abs() <= tol
+                    && (std::ptr::read_unaligned((i + 4) as *const f32) - y).abs() <= tol
+                    && (std::ptr::read_unaligned((i + 8) as *const f32) - z).abs() <= tol
+                {
+                    return i;
+                }
+                i += 4;
+            }
+            scanned = scanned.saturating_add(size);
+        }
+        addr = base.saturating_add(size);
+    }
+    0
+}
+
 /// Enumerate `World.components` (Vec<ComponentInfo>).
 /// This build: Vec header at World+0x180, entry stride 0x50, name String ptr
 /// at entry+0x30 (len at entry+0x38).
@@ -414,10 +689,10 @@ unsafe fn dump_world_deep(world: usize) {
         out.extend_from_slice(&1u64.to_le_bytes());
         out.extend_from_slice(&(o as u64).to_le_bytes());
         out.extend_from_slice(&(p as u64).to_le_bytes());
-        let b = std::slice::from_raw_parts(p as *const u8, 0x200);
+        let b = std::slice::from_raw_parts(p as *const u8, 0x800);
         out.extend_from_slice(b);
-        // Level 2: pointers inside the first 0x100 bytes of this buffer.
-        for o2 in (0..0x100).step_by(8) {
+        // Level 2: pointers inside the first 0x200 bytes of this buffer.
+        for o2 in (0..0x200).step_by(8) {
             let q = std::ptr::read_unaligned((p + o2) as *const u64) as usize;
             if !is_readable(q, 0x40) || l2_count > 6000 {
                 continue;
@@ -446,12 +721,16 @@ unsafe fn dump_world_deep(world: usize) {
 
 unsafe extern "C" fn app_update_hook(app: *mut c_void) {
     let world = (app as usize).wrapping_add(APP_WORLD_OFFSET);
+    APP_PTR.store(app as usize, Ordering::Relaxed);
     WORLD_PTR.store(world, Ordering::Relaxed);
     let n = UPDATE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if n % 60 == 0 {
+        check_target();
+    }
     if n == 1 {
         log(&format!("[core] first App::update; world @ {:#x}", world));
     }
-    if n == 180
+    if n == 50
         && std::env::var("TUNNET_DUMP_WORLD").is_ok()
         && !WORLD_DUMPED.swap(true, Ordering::Relaxed)
     {
@@ -849,6 +1128,78 @@ fn load_mods() {
         .unwrap(),
     );
 
+    // Component size (from ComponentInfo.descriptor.layout) for a type name.
+    let _ = api.set(
+        "component_size",
+        lua.create_function(|_, name: String| {
+            let world = WORLD_PTR.load(Ordering::Relaxed);
+            let r = unsafe {
+                match component_id(world, &name) {
+                    Some(cid) => {
+                        let vec_ptr = read_u64_at(world + 0x180) as usize;
+                        let e = vec_ptr + cid * 0x50;
+                        read_u64_at(e + 0x08)
+                    }
+                    None => 0,
+                }
+            };
+            Ok(r as i64)
+        })
+        .unwrap(),
+    );
+
+    // Number of allocated entity slots (World.entities.meta.len @ World+0x18).
+    let _ = api.set(
+        "entity_count",
+        lua.create_function(|_, ()| {
+            let world = WORLD_PTR.load(Ordering::Relaxed);
+            let n = if world != 0 {
+                unsafe { read_u64_at(world + 0x18) }
+            } else {
+                0
+            };
+            Ok(n as i64)
+        })
+        .unwrap(),
+    );
+
+    // Scan memory for an (f32,f32,f32) triple; returns its address or 0.
+    let _ = api.set(
+        "find_vec3",
+        lua.create_function(|_, (x, y, z, tol): (f32, f32, f32, Option<f32>)| {
+            Ok(unsafe { find_vec3(x, y, z, tol.unwrap_or(0.0)) } as i64)
+        })
+        .unwrap(),
+    );
+
+    // Player world position (via a CE pointer-scan chain). Returns {x,y,z} or nil.
+    let _ = api.set(
+        "search_ptr",
+        lua.create_function(|_, addr: i64| {
+            let res = unsafe { search_ptr(addr as usize) };
+            for (loc, p) in res.iter().take(20) {
+                log(&format!("[search] {loc} -> {p:#x}"));
+            }
+            Ok(res.len() as i64)
+        })
+        .unwrap(),
+    );
+    let _ = api.set(
+        "player_pos",
+        lua.create_function(|lua, ()| {
+            let p = unsafe { player_pos_ptr() };
+            if p == 0 {
+                return Ok(mlua::Value::Nil);
+            }
+            let t = lua.create_table()?;
+            t.set("x", unsafe { std::ptr::read_unaligned(p as *const f32) })?;
+            t.set("y", unsafe { std::ptr::read_unaligned((p + 4) as *const f32) })?;
+            t.set("z", unsafe { std::ptr::read_unaligned((p + 8) as *const f32) })?;
+            Ok(mlua::Value::Table(t))
+        })
+        .unwrap(),
+    );
+
     // Low-level memory access. Advanced/dangerous: used to build typed ECS
     // accessors and to inspect the World. Invalid addresses will crash.
     let mem = lua.create_table().unwrap();
@@ -1127,6 +1478,7 @@ unsafe fn init(module_usize: usize) {
     install_update_hook();
     install_resget_hook();
     load_mods();
+    load_chains();
     log("[core] init complete");
     signal_ready();
 }

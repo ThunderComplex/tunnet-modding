@@ -634,3 +634,117 @@ Verified in-game:
   transform) and spawning entities; then attach loaded assets to entities/UI
   (Bevy asset handles), enabling real new content.
 - Save/config hooks; update-resilient signatures.
+
+---
+
+## 19. Entity access — status / plan (2026-10-05)
+
+### Done
+New-asset pipeline is verified (section 18). `tunnet.asset_bytes` reads any
+asset; mods can register new paths.
+
+### Player position: scan attempt (not adopted)
+Added `tunnet.find_vec3(x,y,z,tol)` which scans private readable memory for an
+`(f32,f32,f32)` triple. It works but is **unreliable for the player**: the save
+`player.pos` did not match a live `Transform.translation` within tolerance, and
+widening the scan blocks the main thread (the Lua callback runs on it). Kept as a
+bounded (64 MB), best-effort primitive only.
+
+### Proper path: reverse the ECS entity layout
+To read the player `Transform` and to spawn, reverse Bevy 0.7:
+- `World { id, entities, components, archetypes, storages, bundles, ... }`
+  (fields compiler-reordered; `components.components` Vec is at World+0x180).
+- `Entities { meta: Vec<EntityMeta>, free_cursor: AtomicI64, pending: Vec<Entity> }`
+  where `EntityMeta { generation, location: EntityLocation }` and
+  `EntityLocation { archetype_id, index, table_id }`.
+- `Archetypes { archetypes: Vec<Archetype>, archetype_component_count,
+  archetype_ids }`; `Archetype { id, entities, edges, table_info,
+  table_components: Box<[ComponentId]>, sparse_set_components,
+  unique_components, components }`.
+- `Storages { sparse_sets, tables }`; `Tables { tables: Vec<Table>, table_ids }`;
+  `Table { columns: SparseSet<ComponentId, Column>, entities: Vec<Entity> }`.
+- `Column { component_id, data: BlobVec, ticks }`; `BlobVec.data` holds the
+  component array; item size/stride comes from `ComponentInfo.descriptor.layout`
+  (in the components Vec at World+0x180).
+- `Transform`/`GlobalTransform` = `{ translation: Vec3, rotation: Quat,
+  scale: Vec3 }` (40 bytes); `translation` at +0.
+
+Plan: locate `World.entities` / `World.archetypes` / `World.storages` offsets
+(e.g. by disassembling `World::get_entity`/`World::spawn_empty`), implement a
+query for a given `ComponentId` (find the archetype whose `table_components`
+contains it), and expose `tunnet.query_component(name)` / entity iteration; then
+player position and spawning. Also hook/duplicate `World::spawn` for spawning.
+
+### Note on testing
+In-game tests load the last save by clicking "Continue" at ~(783,644) on a
+3440x1440 screen (`SetCursorPos` + `mouse_event`); wait ~2s, click, wait ~3-4s.
+The game runs ~12-24 fps, so use low frame thresholds.
+
+### Partial findings (entity lookup)- `World::entity`/`get_entity` (this build) @ `0x140ecfb70`; its core
+  `Entities::get` @ **`0x142220430`** (leaf). From its disassembly:
+  - `Entities.meta` Vec: **ptr @ self+0x10, len @ self+0x18** (bounds-checked as
+    `index >= len -> None`).
+  - `EntityMeta` **stride 24 bytes**; `location` at +0x00 (16 bytes),
+    `generation: u32` at **+0x10**.
+  - `EntityLocation` = 16 bytes; first u64 `== u64::MAX` means a free slot.
+  - Returned as `Option<EntityLocation>` (tag@0, location@8).
+- Still needed: `World.entities` / `World.archetypes` / `World.storages` offsets,
+  `Archetype.table_components`, `Table.columns`, `Column`/`BlobVec.data`, and
+  component stride from `ComponentInfo.descriptor.layout`.
+
+---
+
+## 20. Cheat Engine cross-check — player position (2026-10-05)
+
+User found the live X coordinate with CE and supplied the accessing instructions.
+Their module base was `0x7FF7C9E80000`; RVAs matched this binary.
+
+- Position is at **`+0x44`** inside a **320-byte element** (stride `0x140`) of a
+  game-owned `Vec` — not a Bevy component column.
+- Accessing functions: `0x140c726a0` (reads `[rcx+0x44]`, writes `[rbp+0x44]`),
+  `0x140c3cae0` (`[rbx+0x48]`), `0x140c41e70` (`[r9+0x10]` after `+0x38`,
+  writes `[rsi+0x48]`), `0x140c6c530` (`[rcx+0x3c]`).
+- Element size confirmed: `lea (%rdx,%rdx,4); shl $0x6` = index*0x140.
+- `ComponentInfo.descriptor.layout.size` reader added (`tunnet.component_size`):
+  `Transform`/`GlobalTransform` = 48; `player::Body` = 3; `Head`/`Hand`/
+  `JetPackLight` = 0 (ZST markers); no 320-byte component exists.
+- `World.entities` at **World+0x00**; `meta.ptr` @ +0x10, `meta.len` @ +0x18.
+  `tunnet.entity_count()` returns it (verified: 857).
+
+Next: obtain the CE pointer-scan chain for the position address to recover the
+base pointer (and thus the owning `Vec`/resource), then expose `player_pos()`.
+
+### CE pointer-scan result format (decoded)
+`.PTR` header: `$ce`, `pscanversion`, `modulelistlength:u32`, then per module
+`[name_len:u32][name][base:u64]`; then `maxlevel:u32`, `fCompressedPtr:u8`; if
+compressed: `aligned:u8`, `bitModuleIndex:u8`, `bitModuleOffset:u8`,
+`bitLevel:u8`, `bitOffset:u8`, `endsCount:u8`, `endsCount*4` bytes.
+`.PTR.results.N`: fixed `sizeofentry` (here 13) bytes per path, bit-packed
+(LSB-first): moduleoffset(32), modulenr(8, signed), offsetcount(3),
+offsetcount × offset(12, `<<2` if aligned). Address =
+`module_base[modulenr] + moduleoffset`, then for j=offsetcount-1..0:
+`addr = *(addr) + offsets[j]`.
+
+Decoded 30 paths for the X coord; all rooted in `tier0_s64.dll`
+(`moduleoff 0xff450/0xff458/0xcf2b0/0xffd00`), 5 levels. None resolved in test
+sessions (they pass through module data then garbage) — likely false positives
+or tied to the exact new-game state. `tunnet.player_pos()` is wired up (returns
+nil when the chain fails); offsets are build-specific.
+
+### Second scan (`tunnet_x_coords2`) — stack-rooted
+A fresh scan produced 262 paths rooted in **THREADSTACK0/1** (CE's pseudo-modules
+for thread stacks), e.g. `THREADSTACK1 base=0xbb73bffca8`, static `0xbc73bff810`
+(offset ~`0xFFFFFB68`). So the position is only referenced from a **stack local**
+(consistent with `App`/`World` living on the main thread stack), not from any
+module static. `.PTR` stores the stack pseudo-module base such that
+`static = base + u32(offset)`; the base is ~4 GB off the static, so it can't be
+used as a plain stack base.
+
+Tried: brute-forcing every decoded chain (187 distinct) as `World`/`App`-relative
+suffixes (both orders, all suffixes) — no plausible position found. `target.txt`
+deep-scan was removed (it stalled/crashed the game).
+
+**Conclusion:** `player_pos` is not reachable via module statics or the
+`World`/`App` with the scanned offsets. Making it work needs a mid-function hook
+on the position system (fragile) — deprioritized. `entity_count()` and the
+asset/typed-field APIs remain solid.

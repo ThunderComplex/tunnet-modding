@@ -74,6 +74,7 @@ Mods are plain Lua 5.4 scripts. There is no build step and no manifest.
 | `tunnet.story_unlock(name)` / `tunnet.set_story_unlock(name, bool)` | Read/write story unlock flags: `digging`, `relay`, `hub`, `filter`, `scan_short`, `scan_long`, `jetpack`, `antivirus`, `sprint`, `optical_fiber`, `antenna`, `surface`, `companion`. |
 | `tunnet.read_resource(name, offset, kind)` / `tunnet.write_resource(name, offset, kind, value)` | Generic typed field access. `kind` is `"u8"`, `"u32"`, `"i32"`, or `"f32"`. |
 | `tunnet.asset_bytes(path)` | Read an asset's bytes by logical path (returns `nil` if not found). Mods can add brand-new paths via `override_asset`; they're served on demand by the asset IO hook. |
+| `tunnet.find_vec3(x, y, z[, tol])` | Best-effort scan of private memory for an `(f32,f32,f32)` triple; returns its address or 0. Bounded and can miss; advanced use only. |
 | `tunnet.mem.*` | Low-level memory access (advanced). See below. |
 | `tunnet.override_asset(logical_path, relative_file)` | Replace an embedded asset. See below. |
 

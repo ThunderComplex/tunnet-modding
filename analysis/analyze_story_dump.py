@@ -3,7 +3,15 @@
 import struct, sys
 from pathlib import Path
 
-tmp = Path(r"C:\Users\THUNDE~1\AppData\Local\Temp\opencode")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import common
+
+args = common.common_parser(
+    "Analyze live Story/Credits resource dumps (story.bin/credits.bin).",
+    positional={"name": "dir", "nargs": "?",
+                "help": "directory with story.bin/credits.bin (default <repo>/data)"},
+).parse_args()
+tmp = Path(args.dir) if args.dir else common.resolve_data(args.data)
 c = (tmp / "credits.bin").read_bytes()
 s = (tmp / "story.bin").read_bytes()
 

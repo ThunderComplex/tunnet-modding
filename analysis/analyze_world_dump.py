@@ -3,9 +3,20 @@
 import struct, sys
 from pathlib import Path
 
-p = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(r"H:\dev\Rust\tunnet-modding\deploy-test\world.bin")
-base = int(sys.argv[2], 16) if len(sys.argv) > 2 else None  # module base
-world = int(sys.argv[3], 16) if len(sys.argv) > 3 else None
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import common
+
+parser = common.common_parser(
+    "Annotate a raw World memory dump (8-byte words) to reverse field offsets.",
+    positional={"name": "dump", "nargs": "?",
+                "help": "world.bin (default <repo>/data/world.bin)"},
+)
+parser.add_argument("--base", default=None, help="module base address (hex), for annotations")
+parser.add_argument("--world", default=None, help="world pointer (hex)")
+args = parser.parse_args()
+p = Path(args.dump) if args.dump else common.resolve_data(args.data) / "world.bin"
+base = int(args.base, 16) if args.base else None  # module base
+world = int(args.world, 16) if args.world else None
 d = p.read_bytes()
 
 def classify(v):

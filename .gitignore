@@ -4,3 +4,4 @@ data/
 core.log
 deploy-test/
 __pycache__/
+pointermap/
