@@ -105,6 +105,22 @@ the tooling in `analysis/`; see `data/asset_table.csv` (columns: `path`,
 `data_off`, `data_len`, `data_va`). Common folders: `textures/`, `snd/`,
 `models/`, `man/`, `shaders/`, `fonts/`.
 
+To regenerate the list, point the tools at your `tunnet.exe` and run the
+pipeline in order (details in [`analysis/README.md`](analysis/README.md)):
+
+```powershell
+$env:TUNNET_EXE = "C:\...\steamapps\common\Tunnet\tunnet.exe"
+python analysis/scan_paths.py        # optional recon
+python analysis/map_assets.py
+python analysis/map_assets2.py
+python analysis/find_include_all.py
+python analysis/analyze_unmapped.py  # optional diagnostic
+python analysis/parse_iaa.py         # exact table (uses objdump)
+python analysis/extract_assets.py    # -> assets_extracted/
+```
+
+Outputs land in `data/` (gitignored) and `assets_extracted/` (gitignored).
+
 ---
 
 ## What it can and can't do
