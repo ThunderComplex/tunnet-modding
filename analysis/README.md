@@ -118,6 +118,7 @@ These are for locating code, not part of the linear pipeline.
 | Tool | Purpose |
 |---|---|
 | `xref.py <pattern>...` | Functions that reference matching string literals (LEA + static pointer tables). |
+| `xref_va.py <VA>...` | Code LEAs and static pointers that reference specific addresses. |
 | `refs_raw.py <pattern>...` | Raw LEA reference instruction addresses for patterns. |
 | `callers.py <VA>` | Direct callers (rel32 call/jmp) of an address, plus its `.pdata` range. |
 | `pdata_lookup.py <VA>...` | Resolve VAs to their containing `.pdata` function. |

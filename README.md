@@ -63,7 +63,11 @@ Mods are plain Lua 5.4 scripts. There is no build step and no manifest.
 |---|---|
 | `tunnet.log(msg)` | Write `msg` to `core.log` (prefixed `[lua]`). |
 | `tunnet.on_load(fn)` | Register `fn()` to run once, after all mods are loaded, before the game starts. |
-| `tunnet.on_frame(fn)` | Register `fn(dt_ms)` to run on the main thread (~60 Hz). `dt_ms` is milliseconds since the last tick. |
+| `tunnet.on_frame(fn)` | Register `fn(dt_ms)` to run on the main thread (~60 Hz), driven by the Win32 message pump. `dt_ms` is milliseconds since the last tick. |
+| `tunnet.on_update(fn)` | Register `fn()` to run once per game frame from inside Bevy's `App::update`, just before the frame's systems run. ECS-synced. |
+| `tunnet.frame()` | Number of `App::update` frames so far. |
+| `tunnet.world_ptr()` | Address of the game's Bevy `World` (0 until the first update). |
+| `tunnet.mem.*` | Low-level memory access (advanced). See below. |
 | `tunnet.override_asset(logical_path, relative_file)` | Replace an embedded asset. See below. |
 
 `override_asset` rules:
@@ -74,6 +78,22 @@ Mods are plain Lua 5.4 scripts. There is no build step and no manifest.
   paths and `..` escapes are rejected — a mod can only load files it ships.
 - Call it at load time (top level, or inside `on_load`). Overrides are applied
   before the game builds its asset table.
+
+#### Low-level memory access (`tunnet.mem`)
+
+Advanced, dangerous — invalid addresses crash the game. These exist to build
+typed ECS accessors and to inspect the running `World`.
+
+| Function | Description |
+|---|---|
+| `tunnet.mem.read_u8/u16/u32/u64/i32/f32/f64(addr)` | Read a value at an address. |
+| `tunnet.mem.write_u8/u32/u64/f32(addr, value)` | Write a value at an address. |
+| `tunnet.mem.read_bytes(addr, len)` | Read `len` bytes as a Lua string. |
+| `tunnet.mem.read_cstr(addr)` | Read a NUL-terminated string (max 4096 bytes). |
+
+The `World` pointer plus this API let advanced mods traverse Bevy's data. Typed
+game-state accessors (credits, story flags, inventory, entities) are the next
+milestone; see [What it can and can't do](#what-it-can-and-cant-do).
 
 ### Example
 
@@ -91,6 +111,14 @@ tunnet.on_frame(function(dt)
     frames = frames + 1
     if frames == 60 then
         tunnet.log(string.format("example mod: 60 frames (dt=%.2f ms)", dt))
+    end
+end)
+
+-- ECS-synced: runs once per game frame; world_ptr() is the Bevy World.
+tunnet.on_update(function()
+    if tunnet.frame() == 1 then
+        local w = tunnet.world_ptr()
+        tunnet.log(string.format("example mod: first ECS update; world @ 0x%x", w))
     end
 end)
 
@@ -132,15 +160,21 @@ Outputs land in `data/` (gitignored) and `assets_extracted/` (gitignored).
   startup, keyed by the game's logical asset path.
 - **Run per-frame Lua** on the main thread (timers, polling, scripted logic that
   doesn't need game state).
+- **ECS hook.** Run code once per game frame from inside Bevy's `App::update`
+  (`tunnet.on_update`) and get the game's `World` pointer (`tunnet.world_ptr()`),
+  plus low-level `tunnet.mem.*` read/write.
 - Write to `core.log`.
 
 ### Not yet (roadmap)
 
-- **Game/ECS access.** Mods cannot yet read or change gameplay state (credits,
-  story flags, inventory), spawn entities, or alter UI. This needs the planned
-  "ECS bridge" that hooks Bevy's schedule to obtain the `World`.
+- **Typed game-state access.** The World pointer and raw memory API exist, but
+  there are no typed accessors yet for credits, story flags, inventory, entities,
+  or UI. Game types are not in Bevy's reflection registry and their Rust
+  `TypeId`s cannot be reconstructed from outside, so this needs the component
+  registry (name -> id) reversed from the running `World`. This is the next
+  milestone.
 - **New content.** You can replace existing assets, but you cannot add brand-new
-  asset paths the game never requests (until an ECS/loader hook supports it).
+  asset paths the game never requests (until a loader hook supports it).
 - **Save/config interception.** Runtime save/load hooks are planned; for now
   you can edit `%APPDATA%\tunnet\*.json|*.toml` externally.
 - **Native mods.** By design, mods are Lua/data, never DLLs.
@@ -196,11 +230,13 @@ the game.
 1. `tunnet-loader.exe` starts `tunnet.exe` **suspended** with
    `--bypass-launcher`.
 2. It injects `core.dll` via `CreateRemoteThread(LoadLibraryW)`.
-3. `core.dll` installs two detours:
+3. `core.dll` installs three detours:
    - `EmbeddedAssetIo::add_asset` — called once per embedded asset at startup;
      used to substitute mod assets by path.
    - `PeekMessageW` — the game's Win32 message pump on the main thread; used as
      a ~60 Hz tick to run Lua `on_frame`.
+   - `bevy_app::App::update` — once per game frame; captures the `World` pointer
+     (`App.world`) and runs Lua `on_update` before the frame's systems.
 4. The core loads `mods\**\mod.lua` and signals a ready event.
 5. Only then does the loader resume the game, so asset overrides are always in
    place before the game registers its assets.

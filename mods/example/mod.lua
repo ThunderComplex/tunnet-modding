@@ -15,6 +15,17 @@ tunnet.on_frame(function(dt)
     end
 end)
 
+-- ECS bridge: runs once per game frame from App::update, with the World pointer
+-- available via tunnet.world_ptr().
+tunnet.on_update(function()
+    if tunnet.frame() == 1 then
+        local w = tunnet.world_ptr()
+        tunnet.log(string.format(
+            "example mod: first ECS update; world @ 0x%x (byte0=%d)",
+            w, tunnet.mem.read_u8(w)))
+    end
+end)
+
 -- Replace the Puzzled Squid logo texture with a different icon (visible test).
 -- Paths are relative to this mod's own directory; they cannot escape it.
 tunnet.override_asset("textures/puzzled_squid.png", "puzzled_squid.png")

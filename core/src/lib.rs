@@ -9,7 +9,7 @@
 use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use mlua::{Function, Lua, Table};
@@ -28,6 +28,10 @@ use windows::Win32::UI::WindowsAndMessaging::MSG;
 
 // RVAs in this exact build (see notes sections 11/12).
 const RVA_ADD_ASSET: usize = 0x81fa10;
+// ECS bridge: `bevy_app::App::update` and the offset of `App.world` (the first
+// thing it passes to `Schedule::run`). See notes section 14.
+const RVA_APP_UPDATE: usize = 0x220ee60;
+const APP_WORLD_OFFSET: usize = 0xc0;
 
 static CORE_DIR: Lazy<Mutex<PathBuf>> = Lazy::new(|| Mutex::new(PathBuf::new()));
 static LOG_READY: AtomicBool = AtomicBool::new(false);
@@ -145,6 +149,39 @@ fn on_frame(dt_ms: f64) {
     if let Ok(mut guard) = LUA.lock() {
         if let Some(lua) = guard.as_mut() {
             let _ = dispatch(lua, "_frame", dt_ms);
+        }
+    }
+}
+
+// ---------------------------------------------------------------- ECS bridge
+// Hook `bevy_app::App::update` (called once per frame by the winit runner).
+// `App.world` is the field passed to `Schedule::run`, at `APP_WORLD_OFFSET`.
+type AppUpdateFn = unsafe extern "C" fn(*mut c_void);
+static APP_UPDATE: Lazy<Mutex<Option<GenericDetour<AppUpdateFn>>>> =
+    Lazy::new(|| Mutex::new(None));
+static WORLD_PTR: AtomicUsize = AtomicUsize::new(0);
+static UPDATE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+unsafe extern "C" fn app_update_hook(app: *mut c_void) {
+    let world = (app as usize).wrapping_add(APP_WORLD_OFFSET);
+    WORLD_PTR.store(world, Ordering::Relaxed);
+    let n = UPDATE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 {
+        log(&format!("[core] first App::update; world @ {:#x}", world));
+    }
+    // Run mod callbacks before the game's systems for this frame.
+    on_update();
+    if let Ok(guard) = APP_UPDATE.lock() {
+        if let Some(detour) = guard.as_ref() {
+            let _ = detour.call(app);
+        }
+    }
+}
+
+fn on_update() {
+    if let Ok(mut guard) = LUA.lock() {
+        if let Some(lua) = guard.as_mut() {
+            let _ = dispatch(lua, "_update", 0.0);
         }
     }
 }
@@ -282,8 +319,10 @@ fn load_mods() {
 
     let load_cbs = lua.create_table().unwrap();
     let frame_cbs = lua.create_table().unwrap();
+    let update_cbs = lua.create_table().unwrap();
     let _ = api.set("_load", load_cbs);
     let _ = api.set("_frame", frame_cbs);
+    let _ = api.set("_update", update_cbs);
 
     let _ = api.set(
         "on_load",
@@ -309,6 +348,90 @@ fn load_mods() {
         })
         .unwrap(),
     );
+    let _ = api.set(
+        "on_update",
+        lua.create_function(|lua, f: Function| {
+            let tunnet: Table = lua.globals().get("tunnet")?;
+            let cbs: Table = tunnet.get("_update")?;
+            let entry = lua.create_table()?;
+            entry.set("dir", current_mod_dir_string())?;
+            entry.set("fn", f)?;
+            cbs.set(cbs.len()? + 1, entry)
+        })
+        .unwrap(),
+    );
+    // ECS bridge accessors.
+    let _ = api.set(
+        "world_ptr",
+        lua.create_function(|_, ()| Ok(WORLD_PTR.load(Ordering::Relaxed) as i64))
+            .unwrap(),
+    );
+    let _ = api.set(
+        "frame",
+        lua.create_function(|_, ()| Ok(UPDATE_COUNT.load(Ordering::Relaxed) as i64)).unwrap(),
+    );
+
+    // Low-level memory access. Advanced/dangerous: used to build typed ECS
+    // accessors and to inspect the World. Invalid addresses will crash.
+    let mem = lua.create_table().unwrap();
+    macro_rules! mem_read {
+        ($name:literal, $ty:ty) => {
+            let _ = mem.set(
+                $name,
+                lua.create_function(|_, a: i64| unsafe {
+                    Ok(std::ptr::read_unaligned(a as usize as *const $ty))
+                })
+                .unwrap(),
+            );
+        };
+    }
+    macro_rules! mem_write {
+        ($name:literal, $ty:ty) => {
+            let _ = mem.set(
+                $name,
+                lua.create_function(|_, (a, v): (i64, $ty)| unsafe {
+                    std::ptr::write_unaligned(a as usize as *mut $ty, v);
+                    Ok(())
+                })
+                .unwrap(),
+            );
+        };
+    }
+    mem_read!("read_u8", u8);
+    mem_read!("read_u16", u16);
+    mem_read!("read_u32", u32);
+    mem_read!("read_u64", u64);
+    mem_read!("read_i32", i32);
+    mem_read!("read_f32", f32);
+    mem_read!("read_f64", f64);
+    mem_write!("write_u8", u8);
+    mem_write!("write_u32", u32);
+    mem_write!("write_u64", u64);
+    mem_write!("write_f32", f32);
+    let _ = mem.set(
+        "read_bytes",
+        lua.create_function(|lua, (a, len): (i64, usize)| {
+            let s = unsafe { std::slice::from_raw_parts(a as usize as *const u8, len) };
+            lua.create_string(s)
+        })
+        .unwrap(),
+    );
+    let _ = mem.set(
+        "read_cstr",
+        lua.create_function(|_, a: i64| {
+            let p = a as usize as *const u8;
+            let mut n = 0usize;
+            unsafe {
+                while n < 4096 && *p.add(n) != 0 {
+                    n += 1;
+                }
+                let s = std::slice::from_raw_parts(p, n);
+                Ok(String::from_utf8_lossy(s).into_owned())
+            }
+        })
+        .unwrap(),
+    );
+    let _ = api.set("mem", mem);
 
     let _ = lua.globals().set("tunnet", api);
 
@@ -402,6 +525,26 @@ unsafe fn install_frame_hook() {
     }
 }
 
+unsafe fn install_update_hook() {
+    let base = module_base();
+    let target = (base + RVA_APP_UPDATE) as *const ();
+    let orig: AppUpdateFn = std::mem::transmute(target);
+    match GenericDetour::<AppUpdateFn>::new(orig, app_update_hook) {
+        Ok(d) => {
+            if let Err(e) = d.enable() {
+                log(&format!("[core] App::update enable failed: {e}"));
+            } else {
+                log(&format!(
+                    "[core] App::update hook installed @ {:#x}",
+                    target as usize
+                ));
+                *APP_UPDATE.lock().unwrap() = Some(d);
+            }
+        }
+        Err(e) => log(&format!("[core] App::update detour failed: {e}")),
+    }
+}
+
 fn core_dir_from_module(module: HMODULE) -> PathBuf {
     let mut buf = vec![0u16; 1024];
     let n = unsafe { GetModuleFileNameW(module, &mut buf) } as usize;
@@ -441,6 +584,7 @@ unsafe fn init(module_usize: usize) {
     log(&format!("[core] module base = {:#x}", module_base()));
     install_asset_hook();
     install_frame_hook();
+    install_update_hook();
     load_mods();
     log("[core] init complete");
     signal_ready();

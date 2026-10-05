@@ -385,3 +385,68 @@ thread stays suspended the whole time, so overrides are always in place.
 - Save/config pre-launch patching; runtime file-API detours.
 - ECS bridge (App/Schedule hook) for gameplay + new content + UI.
 - Harden signatures against game updates (signature DB from this build).
+
+---
+
+## 14. ECS bridge — World captured (2026-10-05)
+
+### Locating Bevy functions without symbols
+`<Schedule as Stage>::run` (Bevy 0.7 `schedule/mod.rs`) contains a unique panic:
+`` panic!("`NoAndCheckAgain` would loop infinitely in this situation.") ``.
+That string literal lives in `.rdata` (VA `0x145265970`, referenced via a static
+pointer, not a code LEA). Following the pointer to the code that loads it gives
+the function at **`0x14221cd40`** = `<Schedule as Stage>::run(&mut self, world)`.
+
+Its callers were then examined; **`App::update` = `0x14220ee60`**:
+
+```
+mov  %rcx,%rdi            ; rdi = &mut App
+add  $0x50,%rcx           ; rcx = &mut App.schedule
+lea  0xc0(%rdi),%r14      ; r14 = &mut App.world
+mov  %r14,%rdx
+call 0x14221cd40          ; Schedule::run(schedule, world)
+... loop sub_apps, call runner(world, app)
+```
+
+So in this build:
+- **`App::update` @ RVA `0x220ee60`**
+- **`App.world` @ offset `0xc0`** (field order is compiler-reordered; do not
+  trust Bevy source order)
+- `App.schedule` @ offset `0x50`
+
+`App::update` has exactly one caller (`0x140e92020`, the winit runner), i.e. once
+per frame.
+
+### Hook + API (implemented, verified)
+- Detour `App::update` (RVA `0x220ee60`): capture `world = app + 0xc0`, store it,
+  run Lua `on_update`, then call the trampoline (so mods run before the frame's
+  systems).
+- Lua API added: `tunnet.on_update(fn)`, `tunnet.frame()`, `tunnet.world_ptr()`,
+  and `tunnet.mem.*` (read/write u8/u16/u32/u64/i32/f32/f64, `read_bytes`,
+  `read_cstr`).
+
+Verified run:
+```
+[core] App::update hook installed @ 0x7ff7489bee60
+[core] first App::update; world @ 0x2092bd5af00
+[lua] example mod: first ECS update; world @ 0x2092bd5af00 (byte0=0)
+```
+
+### Why typed access needs the component registry
+- Game types are **not** in Bevy's reflection `TypeRegistry` (saves use serde).
+- Rust `TypeId`s are derived from the crate's disambiguator, so we **cannot
+  reconstruct** the game's `TypeId` for e.g. `tunnet::story::Story` from a
+  separately compiled crate. `TypeId`-keyed resource lookup is therefore out.
+- However, Bevy's `World` keeps a `Components` registry of every component type
+  that systems use, storing each type's **name string** (e.g.
+  `tunnet::story::Story`) and its `ComponentId`/`TypeId`. Game component/resource
+  names are present there at runtime.
+- Plan: reverse the `World`/`Components`/`Storages` layouts, enumerate the
+  component registry by name, and access resources/components by `ComponentId`.
+  This yields typed access without linking against the game's Bevy.
+
+### Next
+- Reverse `World.components` (name -> id) and `World.storages.resources`.
+- Expose `tunnet.resource("tunnet::story::Story")` etc. and typed field access.
+- Then entities/queries and UI.
+- Save/config hooks and update-resilient signatures remain on the roadmap.
