@@ -545,3 +545,47 @@ uses (e.g. `Time`, `Windows` every frame).
   `ComponentInfo.descriptor.layout`/`type_id` to auto-derive offsets.
 - Entities/queries/spawning and UI; save/config hooks; update-resilient
   signatures.
+
+---
+
+## 17. Typed game state — credits + story unlocks (2026-10-05)
+
+### Getting in-game (for testing)
+The main menu was screenshotted to locate buttons. "Continue" is at ~(783, 644)
+on a 3440x1440 screen; clicking it (`SetCursorPos` + `mouse_event`) loads the
+last save. In-game the registry grows to **255 types**; `tunnet::story::Story`
+is `ComponentId` 150. Game type names recovered include `tunnet::player::Body/
+Head/Hand`, `tunnet::credits::Credits`, `tunnet::story::Story`,
+`tunnet::settings::UserSettings/UserGameSettings`, `tunnet::input::Actions/
+KeyBindings`, `tunnet::tools::Tool`, and many `Handles`/`AudioState` resources.
+
+### Empirical field reversing
+Dumped live `Story`/`Credits` memory via `tunnet.mem.read_bytes` and correlated
+with the loaded save (`%APPDATA%\tunnet\slot_2.json`):
+- `player.credits = 131`, `story.digging/relay/hub = true`, `filter = false`,
+  `scan_short = true`, `scan_long = false`, `jetpack..companion = false`.
+- **Credits**: value `131` found at `Credits + 0x20`.
+- **Story unlocks**: the exact 13-bool run
+  `digging,relay,hub,filter,scan_short,scan_long,jetpack,antivirus,sprint,
+  optical_fiber,antenna,surface,companion` is contiguous at **Story+0x1c6**.
+- Nearby (unverified): `shop_level`~+0x1b0, `page_no`~+0x1bc, `pages`~+0x1c0.
+- Note: Rust reorders struct fields, so runtime order != save JSON order; the
+  bools were grouped by the compiler, which is why they are contiguous.
+
+### API added
+- `tunnet.credits()` / `tunnet.set_credits(n)`.
+- `tunnet.story_unlock(name)` / `tunnet.set_story_unlock(name, bool)`.
+- `tunnet.read_resource(name, offset, kind)` /
+  `tunnet.write_resource(name, offset, kind, value)` (`kind`: u8/u32/i32/f32).
+
+Verified in-game:
+```
+credits=131 digging=true jetpack=false
+after write: credits=999 jetpack=true
+```
+
+### Next
+- Name more fields (shop_level, page_no, boss_phase, visited_chunks...), and
+  player position via the `tunnet::player::Body` transform.
+- Entities/queries/spawning and UI; save/config hooks; update-resilient
+  signatures.

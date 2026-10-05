@@ -222,6 +222,43 @@ unsafe fn component_id(world: usize, name: &str) -> Option<usize> {
     names.iter().position(|n| n == name)
 }
 
+/// Resolve a resource pointer, preferring the cache learned from the game.
+unsafe fn cached_resource(world: usize, name: &str) -> usize {
+    match component_id(world, name) {
+        Some(cid) => {
+            let c = RES_CACHE
+                .lock()
+                .ok()
+                .and_then(|c| c.get(&cid).copied())
+                .unwrap_or(0);
+            if c != 0 {
+                c
+            } else {
+                resource_ptr(world, cid)
+            }
+        }
+        None => 0,
+    }
+}
+
+/// Story unlock flags (this build: contiguous bools at Story+0x1c6).
+const STORY_UNLOCKS: &[(&str, usize)] = &[
+    ("digging", 0x1c6),
+    ("relay", 0x1c7),
+    ("hub", 0x1c8),
+    ("filter", 0x1c9),
+    ("scan_short", 0x1ca),
+    ("scan_long", 0x1cb),
+    ("jetpack", 0x1cc),
+    ("antivirus", 0x1cd),
+    ("sprint", 0x1ce),
+    ("optical_fiber", 0x1cf),
+    ("antenna", 0x1d0),
+    ("surface", 0x1d1),
+    ("companion", 0x1d2),
+];
+const CREDITS_OFFSET: usize = 0x20; // Credits.credits in this build
+
 /// Resolve a resource's data pointer from its `ComponentId`, following Bevy's
 /// `World.archetypes.resource().unique_components` sparse set (derived from the
 /// disassembly at RVA 0x225f810).
@@ -591,6 +628,116 @@ fn load_mods() {
                 }
             };
             Ok(p as i64)
+        })
+        .unwrap(),
+    );
+
+    // Typed game-state accessors (this build; offsets are type-specific).
+    let _ = api.set(
+        "credits",
+        lua.create_function(|_, ()| {
+            let world = WORLD_PTR.load(Ordering::Relaxed);
+            let p = unsafe { cached_resource(world, "tunnet::credits::Credits") };
+            Ok(if p != 0 {
+                unsafe { std::ptr::read_unaligned((p + CREDITS_OFFSET) as *const i32) }
+            } else {
+                0
+            })
+        })
+        .unwrap(),
+    );
+    let _ = api.set(
+        "set_credits",
+        lua.create_function(|_, v: i32| {
+            let world = WORLD_PTR.load(Ordering::Relaxed);
+            let p = unsafe { cached_resource(world, "tunnet::credits::Credits") };
+            if p != 0 {
+                unsafe { std::ptr::write_unaligned((p + CREDITS_OFFSET) as *mut i32, v) };
+            }
+            Ok(())
+        })
+        .unwrap(),
+    );
+    let _ = api.set(
+        "story_unlock",
+        lua.create_function(|_, name: String| {
+            let world = WORLD_PTR.load(Ordering::Relaxed);
+            let p = unsafe { cached_resource(world, "tunnet::story::Story") };
+            let off = STORY_UNLOCKS
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, o)| *o);
+            Ok(if p != 0 {
+                match off {
+                    Some(o) => unsafe {
+                        std::ptr::read_unaligned((p + o) as *const u8) != 0
+                    },
+                    None => false,
+                }
+            } else {
+                false
+            })
+        })
+        .unwrap(),
+    );
+    let _ = api.set(
+        "set_story_unlock",
+        lua.create_function(|_, (name, val): (String, bool)| {
+            let world = WORLD_PTR.load(Ordering::Relaxed);
+            let p = unsafe { cached_resource(world, "tunnet::story::Story") };
+            if let Some((_, o)) = STORY_UNLOCKS.iter().find(|(n, _)| *n == name) {
+                if p != 0 {
+                    unsafe {
+                        std::ptr::write_unaligned((p + o) as *mut u8, if val { 1 } else { 0 })
+                    };
+                }
+            }
+            Ok(())
+        })
+        .unwrap(),
+    );
+    // Generic resource field access: kind is "u8"/"u32"/"i32"/"f32".
+    let _ = api.set(
+        "read_resource",
+        lua.create_function(|_, (name, off, kind): (String, i64, String)| {
+            let world = WORLD_PTR.load(Ordering::Relaxed);
+            let p = unsafe { cached_resource(world, &name) };
+            if p == 0 {
+                return Ok(0f64);
+            }
+            let a = (p + off as usize) as *const u8;
+            let v = unsafe {
+                match kind.as_str() {
+                    "u8" => std::ptr::read_unaligned(a) as f64,
+                    "u32" => std::ptr::read_unaligned(a as *const u32) as f64,
+                    "i32" => std::ptr::read_unaligned(a as *const i32) as f64,
+                    "f32" => std::ptr::read_unaligned(a as *const f32) as f64,
+                    _ => 0.0,
+                }
+            };
+            Ok(v)
+        })
+        .unwrap(),
+    );
+    let _ = api.set(
+        "write_resource",
+        lua.create_function(|_, (name, off, kind, v): (String, i64, String, f64)| {
+            let world = WORLD_PTR.load(Ordering::Relaxed);
+            let p = unsafe { cached_resource(world, &name) };
+            if p == 0 {
+                return Ok(());
+            }
+            let a = (p + off as usize) as *mut u8;
+            unsafe {
+                match kind.as_str() {
+                    "u8" => std::ptr::write_unaligned(a, v as u8),
+                    "u32" => std::ptr::write_unaligned(a as *mut u32, v as u32),
+                    "i32" => std::ptr::write_unaligned(a as *mut i32, v as i32),
+                    "f32" => std::ptr::write_unaligned(a as *mut f32, v as f32),
+                    _ => {}
+                }
+            }
+            Ok(())
         })
         .unwrap(),
     );

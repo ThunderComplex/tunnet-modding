@@ -35,6 +35,16 @@ tunnet.on_update(function()
                 tostring(tunnet.component_id(n)), tunnet.resource(n)))
         end
     end
+    if tunnet.frame() == 50 then
+        tunnet.log(string.format(
+            "example mod: credits=%d digging=%s jetpack=%s",
+            tunnet.credits(),
+            tostring(tunnet.story_unlock("digging")),
+            tostring(tunnet.story_unlock("jetpack"))))
+        -- Writes (uncomment to try):
+        -- tunnet.set_credits(999)
+        -- tunnet.set_story_unlock("jetpack", true)
+    end
 end)
 
 -- Replace the Puzzled Squid logo texture with a different icon (visible test).

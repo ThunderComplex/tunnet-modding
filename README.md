@@ -70,6 +70,9 @@ Mods are plain Lua 5.4 scripts. There is no build step and no manifest.
 | `tunnet.components()` | Array of registered component/resource type names (e.g. `"tunnet::state::GameState"`). |
 | `tunnet.component_id(name)` | `ComponentId` index for a type name, or `nil` if not registered yet. |
 | `tunnet.resource(name)` | Pointer to a resource's data (0 if absent). Populated from the game's own resource lookups, so call it after a few frames. Use with `tunnet.mem.*`. |
+| `tunnet.credits()` / `tunnet.set_credits(n)` | Read/write the player's credits. |
+| `tunnet.story_unlock(name)` / `tunnet.set_story_unlock(name, bool)` | Read/write story unlock flags: `digging`, `relay`, `hub`, `filter`, `scan_short`, `scan_long`, `jetpack`, `antivirus`, `sprint`, `optical_fiber`, `antenna`, `surface`, `companion`. |
+| `tunnet.read_resource(name, offset, kind)` / `tunnet.write_resource(name, offset, kind, value)` | Generic typed field access. `kind` is `"u8"`, `"u32"`, `"i32"`, or `"f32"`. |
 | `tunnet.mem.*` | Low-level memory access (advanced). See below. |
 | `tunnet.override_asset(logical_path, relative_file)` | Replace an embedded asset. See below. |
 
@@ -170,15 +173,19 @@ Outputs land in `data/` (gitignored) and `assets_extracted/` (gitignored).
   (`tunnet.components()`), look up a type's `ComponentId`
   (`tunnet.component_id(name)`), and get a pointer to a resource's data
   (`tunnet.resource(name)`).
+- **Typed game state.** Read/write player credits (`tunnet.credits()` /
+  `set_credits`), story unlock flags (`tunnet.story_unlock` /
+  `set_story_unlock`), and arbitrary resource fields by offset
+  (`tunnet.read_resource` / `write_resource`).
 - Write to `core.log`.
 
 ### Not yet (roadmap)
 
-- **Typed fields / entities / UI.** `tunnet.resource(name)` gives a raw data
-  pointer; reading specific fields still needs per-type offsets (no typed
-  accessors yet). Entities, queries, spawning, and UI need the
-  entity/archetype/storage layouts. Game types only appear in the registry once
-  the game registers them (in-game, not at the main menu).
+- **Other fields / entities / UI.** Only the credits and the 13 unlock flags
+  have named accessors; other fields need per-type offsets (use
+  `read_resource`/`write_resource`). Entities, queries, spawning, and UI need
+  the entity/archetype/storage layouts. Game types only register in-game, so
+  call these after starting/loading a game (not at the main menu).
 - **New content.** You can replace existing assets, but you cannot add brand-new
   asset paths the game never requests (until a loader hook supports it).
 - **Save/config interception.** Runtime save/load hooks are planned; for now
