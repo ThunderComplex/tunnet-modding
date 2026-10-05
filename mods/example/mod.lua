@@ -27,8 +27,13 @@ tunnet.on_update(function()
     if tunnet.frame() == 5 then
         local comps = tunnet.components()
         tunnet.log(string.format("example mod: %d types registered", #comps))
-        tunnet.log("example mod: GameState id = " ..
-            tostring(tunnet.component_id("tunnet::state::GameState")))
+        for _, n in ipairs({
+            "bevy_core::time::time::Time",
+            "bevy_window::windows::Windows",
+        }) do
+            tunnet.log(string.format("example mod: resource %s id=%s ptr=0x%x", n,
+                tostring(tunnet.component_id(n)), tunnet.resource(n)))
+        end
     end
 end)
 

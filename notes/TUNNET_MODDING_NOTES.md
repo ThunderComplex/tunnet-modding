@@ -494,3 +494,54 @@ heap (each readable pointer's first `0x200`/`0x40` bytes), validated with
 - Reverse `Storages.tables` to turn a `ComponentId` into a resource data
   pointer: expose `tunnet.resource(name) -> ptr` and typed field access.
 - Then entities/queries and UI; save/config hooks; update-resilient signatures.
+
+---
+
+## 16. Resource pointers — SOLVED via the game's own lookups (2026-10-05)
+
+### Bevy 0.7 resource storage
+Resources are **not** in `Storages`; they live in the special resource
+archetype's `unique_components`:
+`World.archetypes.resource().unique_components: SparseSet<ComponentId, Column>`.
+- `Archetypes { archetypes: Vec<Archetype>, .. }`, `resource()` =
+  `archetypes[ArchetypeId::RESOURCE]`.
+- `Archetype { id, entities, edges, table_info, table_components,
+  sparse_set_components, unique_components, components }`.
+- `SparseSet { dense: Vec<V>, indices: Vec<I>, sparse: SparseArray<I, usize> }`.
+- `Column { component_id, data: BlobVec, ticks }`.
+- `BlobVec { item_layout, capacity, len, data, swap_scratch, drop }`.
+
+### Accessor at RVA 0x225f810 (leaf)
+Disassembly (called by `World::resource::<T>` monomorphizations):
+```
+mov  0x120(%rcx),%rax        ; X = [self+0x120]
+cmp  %rdx,0x220(%rax)        ; if cid >= sparse_len -> null
+mov  0x218(%rax),%rcx        ; sparse values ptr (Vec<Option<usize>>, 16B elems)
+imul $0x58,0x8(%rcx,%rdx,16) ; dense index -> Column stride 0x58
+mov  0x1e8(%rax),%r8         ; dense Vec<Column> ptr
+mov  0x38(%r8,%rcx,1),%rcx   ; Column+0x38 = BlobVec.len
+cmove %rcx,%rax              ; return 0 if empty, else &Column
+```
+Then the caller reads `Column+0x40` = `BlobVec.data` = the resource pointer.
+So: **Column stride 0x58; len at +0x38; data at +0x40.**
+
+### Why we cache instead of computing from the World
+The accessor's `self` (arg0) is **not** the main `World` (`world_ptr`); hooking
+`0x225f810` showed a constant arg0 different from `App.world`, i.e. it is called
+on another world/self. Rather than pin `World -> resource archetype ->
+unique_components` offsets, the core **hooks `0x225f810`** and records
+`ComponentId -> Column.data` for every resource the game looks up (validated:
+`len == 1`, readable heap pointer). This covers all resources the game actually
+uses (e.g. `Time`, `Windows` every frame).
+
+### API added
+- `tunnet.resource(name) -> ptr` (0 if unknown/not yet accessed).
+- Verified: `Time` (cid 8) -> `0x29d9c223560`, `Windows` (cid 41) ->
+  `0x29d0d5fdc70`; hook log `ret=<Column> len=1 data=<heap ptr>`.
+
+### Next
+- Typed field access: reverse per-type field offsets (start with
+  `tunnet::story::Story`, `tunnet::player::...`) or reverse
+  `ComponentInfo.descriptor.layout`/`type_id` to auto-derive offsets.
+- Entities/queries/spawning and UI; save/config hooks; update-resilient
+  signatures.

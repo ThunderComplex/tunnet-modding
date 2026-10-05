@@ -222,6 +222,50 @@ unsafe fn component_id(world: usize, name: &str) -> Option<usize> {
     names.iter().position(|n| n == name)
 }
 
+/// Resolve a resource's data pointer from its `ComponentId`, following Bevy's
+/// `World.archetypes.resource().unique_components` sparse set (derived from the
+/// disassembly at RVA 0x225f810).
+unsafe fn resource_ptr(world: usize, cid: usize) -> usize {
+    if world == 0 {
+        return 0;
+    }
+    // X = resource archetype (from World+0x1e0 in this build).
+    let x = read_u64_at(world + 0x1e0) as usize;
+    if std::env::var("TUNNET_DEBUG_RES").is_ok() {
+        log(&format!(
+            "[res] world=0x{world:x} cid={cid} x=0x{x:x} readable={}",
+            is_readable(x, 0x228)
+        ));
+    }
+    if !is_readable(x, 0x228) {
+        return 0;
+    }
+    let sparse_ptr = read_u64_at(x + 0x218) as usize;
+    let sparse_len = read_u64_at(x + 0x220) as usize;
+    let dense_ptr = read_u64_at(x + 0x1e8) as usize;
+    if std::env::var("TUNNET_DEBUG_RES").is_ok() {
+        log(&format!(
+            "[res] sparse_ptr=0x{sparse_ptr:x} sparse_len={sparse_len} dense_ptr=0x{dense_ptr:x}"
+        ));
+    }
+    if cid >= sparse_len || !is_readable(sparse_ptr + cid * 0x10, 0x10) {
+        return 0;
+    }
+    // SparseArray<ComponentId, usize>: Vec<Option<usize>>, 16-byte elements.
+    if read_u64_at(sparse_ptr + cid * 0x10) == 0 {
+        return 0; // None
+    }
+    let dense_index = read_u64_at(sparse_ptr + cid * 0x10 + 8) as usize;
+    let column = dense_ptr + dense_index * 0x58;
+    if !is_readable(column, 0x48) {
+        return 0;
+    }
+    if read_u64_at(column + 0x38) == 0 {
+        return 0; // empty column
+    }
+    read_u64_at(column + 0x40) as usize
+}
+
 unsafe fn dump_world_deep(world: usize) {
     let mut out = Vec::new();
     out.extend_from_slice(&(world as u64).to_le_bytes());
@@ -523,6 +567,33 @@ fn load_mods() {
         })
         .unwrap(),
     );
+    // Pointer to a resource's data (0 if absent). Use with tunnet.mem.* to read
+    // fields (field offsets are type-specific).
+    let _ = api.set(
+        "resource",
+        lua.create_function(|_, name: String| {
+            let world = WORLD_PTR.load(Ordering::Relaxed);
+            let p = unsafe {
+                match component_id(world, &name) {
+                    Some(cid) => {
+                        let cached = RES_CACHE
+                            .lock()
+                            .ok()
+                            .and_then(|c| c.get(&cid).copied())
+                            .unwrap_or(0);
+                        if cached != 0 {
+                            cached
+                        } else {
+                            resource_ptr(world, cid)
+                        }
+                    }
+                    None => 0,
+                }
+            };
+            Ok(p as i64)
+        })
+        .unwrap(),
+    );
 
     // Low-level memory access. Advanced/dangerous: used to build typed ECS
     // accessors and to inspect the World. Invalid addresses will crash.
@@ -678,6 +749,51 @@ unsafe fn install_frame_hook() {
     }
 }
 
+type ResGetFn = unsafe extern "C" fn(*mut c_void, usize) -> *mut c_void;
+static RES_GET: Lazy<Mutex<Option<GenericDetour<ResGetFn>>>> = Lazy::new(|| Mutex::new(None));
+static RESGET_COUNT: AtomicU64 = AtomicU64::new(0);
+/// ComponentId -> resource data pointer, learned from the game's own lookups.
+static RES_CACHE: Lazy<Mutex<std::collections::HashMap<usize, usize>>> =
+    Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+
+unsafe extern "C" fn res_get_hook(a: *mut c_void, cid: usize) -> *mut c_void {
+    let r = if let Ok(g) = RES_GET.lock() {
+        g.as_ref().map(|d| d.call(a, cid)).unwrap_or(std::ptr::null_mut())
+    } else {
+        std::ptr::null_mut()
+    };
+    let n = RESGET_COUNT.fetch_add(1, Ordering::Relaxed);
+    if !r.is_null() && is_readable(r as usize, 0x48) {
+        let len = read_u64_at(r as usize + 0x38);
+        let data = read_u64_at(r as usize + 0x40) as usize;
+        if len > 0 && data > 0x10000 {
+            if let Ok(mut c) = RES_CACHE.lock() {
+                c.insert(cid, data);
+            }
+        }
+        if std::env::var("TUNNET_DEBUG_RES").is_ok() && n < 12 {
+            log(&format!(
+                "[resget] arg0=0x{:x} cid={} ret=0x{:x} len={} data=0x{:x}",
+                a as usize, cid, r as usize, len, data
+            ));
+        }
+    }
+    r
+}
+unsafe fn install_resget_hook() {
+    let base = module_base();
+    let target = (base + 0x225f810) as *const ();
+    let orig: ResGetFn = std::mem::transmute(target);
+    match GenericDetour::<ResGetFn>::new(orig, res_get_hook) {
+        Ok(d) => {
+            let _ = d.enable();
+            *RES_GET.lock().unwrap() = Some(d);
+            log("[core] resource-getter hook installed");
+        }
+        Err(e) => log(&format!("[core] resource-getter detour failed: {e}")),
+    }
+}
+
 unsafe fn install_update_hook() {
     let base = module_base();
     let target = (base + RVA_APP_UPDATE) as *const ();
@@ -738,6 +854,7 @@ unsafe fn init(module_usize: usize) {
     install_asset_hook();
     install_frame_hook();
     install_update_hook();
+    install_resget_hook();
     load_mods();
     log("[core] init complete");
     signal_ready();
